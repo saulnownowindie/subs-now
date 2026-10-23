@@ -1020,6 +1020,7 @@ def _es_plantilla_media_pool(clip, en_carpeta_plantillas=False):
         en_carpeta_plantillas
         or "fusion" in tipo
         or "title" in tipo
+        or "text" in tipo
         or ruta.endswith((".setting", ".comp"))
     )
 
