@@ -1,0 +1,17 @@
+# Entorno local y archivos regenerables
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+cuda-runtime/
+models/
+*.srt
+*.wav
+*.pkl
+traducciones_cache.json
+app/subtitulos_config.json
+outputs/
+build/
+dist/
+*.spec
