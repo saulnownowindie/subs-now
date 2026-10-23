@@ -1,0 +1,15 @@
+{
+  "guion": "",
+  "srt": "",
+  "plantilla": "(SRT como pista de subtítulos)",
+  "pistas": [1],
+  "rango": "full",
+  "subs": true,
+  "txt": false,
+  "comparar": false,
+  "solo_srt": false,
+  "idioma": "es",
+  "traducir": false,
+  "idioma_destino": "es",
+  "estilo_trad": "palabras"
+}
