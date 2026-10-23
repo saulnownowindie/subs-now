@@ -23,6 +23,11 @@ La primera instalación descarga el modelo `large-v3-turbo` (varios cientos de M
 
 Luego reiniciá DaVinci Resolve y abrí **Workspace > Scripts > Edit > SubsSaul**.
 
+El selector de plantilla busca composiciones Fusion y títulos compatibles en
+todo el Media Pool. La plantilla elegida debe contener un nodo **Text+**; el
+programa comprueba esto al insertarla en la timeline y explica el problema si
+el elemento seleccionado no es editable como Text+.
+
 ## Requisitos y límites
 
 - Windows 10/11 de 64 bits y Python 3.12.
