@@ -278,11 +278,6 @@ class SubtitulosApp:
         except tk.TclError:
             r.geometry("1180x820")
         iu.apply_window_icon(r)
-        try:
-            r.attributes("-topmost", True)
-            r.after(700, lambda: r.attributes("-topmost", False))
-        except tk.TclError:
-            pass
 
     def _build_header(self):
         self.header = tk.Frame(self.root, bg=iu.BG)
@@ -532,7 +527,7 @@ class SubtitulosApp:
 
     # ── 5. PLANTILLA ─────────────────────────────────────────
     def _build_plantilla(self):
-        card, body, hint = self._section(self.col_right, 5, "PLANTILLA", "SNAP CAPTIONS")
+        card, body, hint = self._section(self.col_right, 5, "PLANTILLA", "MEDIA POOL")
         self.hint_tpl = hint
         row = tk.Frame(body, bg=iu.SURFACE)
         row.pack(fill="x")
@@ -838,8 +833,9 @@ class SubtitulosApp:
         if valores and actual not in valores:
             self.v_tpl.set(valores[0])
         if not silencioso:
-            self._log(f"{max(0, len(valores) - 1)} plantillas de Snap Captions.", "info")
-            self._set_estado("idle", f"{max(0, len(valores) - 1)} plantillas disponibles.")
+            cantidad = max(0, len(valores) - 1)
+            self._log(f"{cantidad} candidatos Text+/Fusion detectados en el Media Pool.", "info")
+            self._set_estado("idle", f"{cantidad} candidatos de plantilla disponibles en el Media Pool.")
 
     # ─────────────────────────────────────────────────────────
     # MODOS
@@ -863,7 +859,7 @@ class SubtitulosApp:
         usa_plantilla = subs and not solo
         self.sel_tpl.set_enabled(usa_plantilla)
         self.btn_tpl.set_enabled(usa_plantilla)
-        self.hint_tpl.configure(text="SNAP CAPTIONS" if usa_plantilla else "NO SE USA")
+        self.hint_tpl.configure(text="MEDIA POOL" if usa_plantilla else "NO SE USA")
         if self.v_solo.get():
             modo = "SOLO SRT"
         elif comp:

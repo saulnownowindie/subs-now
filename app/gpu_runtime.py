@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -13,13 +14,31 @@ def _app_dir() -> Path:
 
 
 def preparar_cuda() -> list[str]:
-    """Agrega al proceso las carpetas DLL locales de CUDA si el instalador las dejó."""
-    base = _app_dir() / "cuda-runtime"
-    if not base.is_dir():
-        return []
+    """Registra DLL de CUDA del instalador o de los paquetes NVIDIA de Python."""
+    app = _app_dir()
+    bases = [app / "cuda-runtime", app.parent / "cuda-runtime"]
+    bases.extend(Path(p) / "nvidia" for p in sys.path if p and Path(p).is_dir())
+    # El ejecutable empaquetado no conserva el sys.path de Python; en la PC
+    # donde se instala, CUDA puede estar en la instalación de Python 3.12.
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        bases.append(Path(local) / "Programs" / "Python" / "Python312"
+                     / "Lib" / "site-packages" / "nvidia")
 
-    rutas = [base]
-    rutas.extend(p for p in base.rglob("*") if p.is_dir())
+    rutas = []
+    for base in bases:
+        if not base.is_dir():
+            continue
+        if base.name.lower() == "nvidia":
+            rutas.extend(p / "bin" for p in base.iterdir()
+                         if p.is_dir() and (p / "bin").is_dir()
+                         and "cu11" not in p.name.lower())
+        else:
+            rutas.append(base)
+            rutas.extend(p for p in base.rglob("*") if p.is_dir())
+    rutas = list(dict.fromkeys(p for p in rutas if p.is_dir()))
+    if not rutas:
+        return []
     cargadores = []
     for ruta in rutas:
         try:

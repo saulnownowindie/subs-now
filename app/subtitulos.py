@@ -554,20 +554,7 @@ def es_alucinacion(seg):
 
 
 def _dlls_cuda():
-    for base in sys.path:
-        nv = os.path.join(base, "nvidia")
-        if not os.path.isdir(nv):
-            continue
-        for sub in os.listdir(nv):
-            if "cu11" in sub:
-                continue
-            b = os.path.join(nv, sub, "bin")
-            if os.path.isdir(b):
-                try:
-                    os.add_dll_directory(b)
-                except Exception:
-                    pass
-                os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+    return gpu_runtime.preparar_cuda()
 
 
 def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90,
@@ -581,7 +568,6 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90,
     _idioma_detectado = "" if idioma in ("", "auto") else idioma
     language = None if idioma in ("", "auto") else idioma
     _dlls_cuda()
-    gpu_runtime.preparar_cuda()
     from faster_whisper import WhisperModel
 
     total = 0.0
@@ -598,21 +584,19 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90,
     total = total or 1.0
 
     nombre_gpu = gpu_runtime.nvidia_info()
-    dispositivo = "cuda" if nombre_gpu else "cpu"
+    dispositivo = "cuda"
     if modelo is not None:
         model = modelo
-        dispositivo = "cuda" if nombre_gpu else "cpu"
+        dispositivo = "cuda"
     else:
-        if nombre_gpu:
-            progreso(p_ini, f"GPU detectada: {nombre_gpu}. Cargando Whisper en CUDA…")
-            try:
-                model = WhisperModel(MODEL, device="cuda", compute_type="int8_float16")
-            except Exception as exc:
-                dispositivo = "cpu"
-                progreso(p_ini, f"CUDA no inició ({type(exc).__name__}); continúo en CPU.")
-                model = WhisperModel(MODEL, device="cpu", compute_type="int8")
-        else:
-            progreso(p_ini, "No detecté una GPU NVIDIA. Cargando Whisper en CPU…")
+        etiqueta_gpu = f"GPU NVIDIA: {nombre_gpu}" if nombre_gpu else "GPU CUDA"
+        progreso(p_ini, f"Probando {etiqueta_gpu}; cargando Whisper…")
+        try:
+            model = WhisperModel(MODEL, device="cuda", compute_type="int8_float16")
+        except Exception as exc:
+            dispositivo = "cpu"
+            _log(f"No se pudo iniciar CUDA; se cambia a CPU: {type(exc).__name__}: {exc}")
+            progreso(p_ini, f"CUDA no inició ({type(exc).__name__}); continúo en CPU.")
             model = WhisperModel(MODEL, device="cpu", compute_type="int8")
 
     def ejecutar(modelo_actual, dispositivo_actual):
@@ -649,13 +633,25 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90,
         return palabras
 
     try:
-        return ejecutar(model, "GPU NVIDIA (CUDA)" if dispositivo == "cuda" else "CPU")
+        etiqueta = (f"GPU NVIDIA ({nombre_gpu}, CUDA)" if nombre_gpu
+                    else "GPU (CUDA)")
+        return ejecutar(model, etiqueta if dispositivo == "cuda" else "CPU")
     except Exception as exc:
         if _cancelar_procesos.is_set() or dispositivo != "cuda":
             raise
         progreso(p_ini, f"Falló CUDA ({type(exc).__name__}); repito la transcripción completa en CPU…")
-        model_cpu = WhisperModel(MODEL, device="cpu", compute_type="int8")
-        return ejecutar(model_cpu, "CPU (respaldo tras fallo de CUDA)")
+        _log(f"Falló CUDA al transcribir; se reintenta en CPU: {type(exc).__name__}: {exc}")
+        try:
+            model_cpu = WhisperModel(MODEL, device="cpu", compute_type="int8")
+            return ejecutar(model_cpu, "CPU (respaldo tras fallo de CUDA)")
+        except Exception as exc_cpu:
+            if _cancelar_procesos.is_set():
+                raise
+            raise RuntimeError(
+                "Falló la GPU y tampoco se pudo completar en CPU. "
+                f"Error CUDA: {type(exc).__name__}: {exc}. "
+                f"Error CPU: {type(exc_cpu).__name__}: {exc_cpu}"
+            ) from exc_cpu
 
 
 def corregir(palabras, guion, nombres=None):
@@ -1013,18 +1009,39 @@ def _respaldar(ruta):
         pass
 
 
-def _clips(carpeta, en_plantillas, out):
+def _es_plantilla_media_pool(clip, en_carpeta_plantillas=False):
+    """MediaPoolItem no expone siempre su FusionComp; usa su tipo/ruta para listar candidatos."""
+    try:
+        tipo = str(clip.GetClipProperty("Type") or "").strip().lower()
+        ruta = str(clip.GetClipProperty("File Path") or "").strip().lower()
+    except Exception:
+        tipo, ruta = "", ""
+    return (
+        en_carpeta_plantillas
+        or "fusion" in tipo
+        or "title" in tipo
+        or ruta.endswith((".setting", ".comp"))
+    )
+
+
+def _clips(carpeta, en_carpeta_plantillas, out, ruta=()):
     for c in carpeta.GetClipList() or []:
-        if en_plantillas:
-            try:
-                tipo = c.GetClipProperty("Type") + " " + c.GetClipProperty("File Path")
-            except Exception:
-                tipo = ""
-            if "subtitle" in tipo.lower() or tipo.lower().strip().endswith(".srt"):
-                continue
-            out[c.GetName()] = c
+        if not _es_plantilla_media_pool(c, en_carpeta_plantillas):
+            continue
+        try:
+            tipo = str(c.GetClipProperty("Type") or "").lower()
+            ruta_archivo = str(c.GetClipProperty("File Path") or "").lower()
+        except Exception:
+            tipo, ruta_archivo = "", ""
+        if "subtitle" in tipo or ruta_archivo.endswith(".srt"):
+            continue
+        etiqueta = " / ".join((*ruta, c.GetName()))
+        out[etiqueta] = c
     for f in carpeta.GetSubFolderList() or []:
-        _clips(f, en_plantillas or f.GetName().strip().lower() in CARPETA_PLANTILLAS, out)
+        nombre = f.GetName().strip()
+        marcada = (en_carpeta_plantillas
+                   or nombre.lower() in CARPETA_PLANTILLAS)
+        _clips(f, marcada, out, (*ruta, nombre))
 
 
 def plantillas():
@@ -1056,11 +1073,30 @@ def aplicar_plantilla(tpl, bloques, f_ini, progreso, p_ini=92, p_fin=100):
             "recordFrame": f_ini + round(s * FPS),
         })
     items = mp.AppendToTimeline(infos) or []
-    for n, (it, b) in enumerate(zip(items, bloques)):
+    if len(items) != len(bloques):
+        if items:
+            try:
+                timeline.DeleteClips(items)
+            except Exception:
+                pass
+        raise RuntimeError("Resolve no pudo insertar todos los títulos de la plantilla seleccionada.")
+    comps_tools = []
+    for it in items:
         comp = it.GetFusionCompByIndex(1)
         tools = comp.GetToolList(False, "TextPlus") if comp else {}
-        if tools:
-            tools[1].StyledText = b[0]
+        tool = next(iter((tools or {}).values()), None)
+        if tool is None:
+            try:
+                timeline.DeleteClips(items)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "El elemento elegido no contiene un nodo Text+ editable. "
+                "Elegí un clip de tipo Fusion Composition/Text+ del Media Pool."
+            )
+        comps_tools.append(tool)
+    for n, (tool, b) in enumerate(zip(comps_tools, bloques)):
+        tool.StyledText = b[0]
         progreso(p_ini + (p_fin - p_ini) * n / max(1, len(items)),
                  "Aplicando plantilla...")
     return len(items) == len(bloques)
