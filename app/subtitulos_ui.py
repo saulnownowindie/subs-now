@@ -1015,7 +1015,7 @@ class SubtitulosApp:
 
         def leer_plantillas():
             try:
-                valores = list(self.backend.plantillas() or [])
+                valores = list(self.backend.plantillas(forzar=not silencioso) or [])
                 error = None
             except Exception as exc:
                 valores, error = [], f"No pude leer las plantillas: {exc}"
@@ -1323,7 +1323,7 @@ class SubtitulosApp:
                     self._actualizar_plantillas(valores)
                     if not silencioso and not error:
                         cantidad = max(0, len(valores) - 1)
-                        self._log(f"{cantidad} candidatos Text+/Fusion detectados en el Media Pool.", "info")
+                        self._log(f"{cantidad} plantillas de texto (Fusion Title / Text+) en el Media Pool.", "info")
                         if cantidad > 0:
                             self._log("Plantillas: " + " | ".join(valores[1:]), "info")
                         self._set_estado("idle", f"{cantidad} candidatos de plantilla disponibles en el Media Pool.")
@@ -1367,7 +1367,7 @@ class SubtitulosApp:
         if not self._busy:
             self._request_state_refresh()
             ahora = time.monotonic()
-            if ahora - self._last_template_scan >= 5.0:
+            if ahora - self._last_template_scan >= 30.0:
                 self._last_template_scan = ahora
                 self._refrescar_plantillas(silencioso=True)
             self._actualizar_rutas()

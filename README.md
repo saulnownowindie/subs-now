@@ -50,6 +50,9 @@ Es idempotente: podés volver a ejecutarlo cuando actualices con `git pull`.
    (o el acceso directo «Indie Now Subtitulos»).
 3. Elegí qué hacer: subtítulos, `.txt`, comparar con guion, o sólo SRT.
 4. Marcá las pistas de audio, el rango (In/Out o timeline completa) y la plantilla.
+   El selector muestra **solo** plantillas con texto (Fusion Title o Text+); las capas
+   de ajuste, luces y zooms del Media Pool no aparecen aunque estén en una carpeta
+   "plantillas".
 5. **GENERAR SUBTÍTULOS**. Hay botón **CANCELAR** mientras corre.
 
 La primera transcripción descarga el modelo de Whisper (~500 MB) y tarda más; las

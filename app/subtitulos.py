@@ -973,6 +973,26 @@ def _propiedad_clip(clip, nombre):
     except Exception: return ""
 
 
+def _props_clip(clip):
+    """Todas las propiedades del clip en UNA sola llamada.
+
+    Pedir `GetClipProperty("Type")` cuesta ~5 ms; el diccionario completo
+    ~1 ms. Recorriendo el Media Pool esa diferencia se siente en la ventana,
+    así que se lee todo junto una vez por clip.
+    """
+    try:
+        datos = clip.GetClipProperty() or {}
+    except Exception:
+        datos = {}
+    props = {str(k).strip().lower(): str(v or "").strip() for k, v in datos.items()}
+    if not props:
+        for clave in ("Type", "File Path", "Clip Name"):
+            valor = _propiedad_clip(clip, clave)
+            if valor:
+                props[clave.lower()] = valor
+    return props
+
+
 def _tiene_textplus(clip):
     try: cantidad = int(clip.GetFusionCompCount() or 0)
     except Exception: cantidad = 1
@@ -984,21 +1004,59 @@ def _tiene_textplus(clip):
     return False
 
 
-def _es_plantilla_media_pool(clip, en_carpeta_plantillas=False):
-    tipo = _propiedad_clip(clip, "Type").lower()
-    ruta = _propiedad_clip(clip, "File Path").lower()
-    nombre = " ".join((str(clip.GetName() or ""), _propiedad_clip(clip, "Clip Name"))).lower()
-    if any(p in nombre for p in ("solid color", "color generator", "color bars", "noise")): return False
-    tipo_titulo = any(p in tipo for p in ("fusion", "title", "titulo", "título", "titre", "titel", "titolo", "generator", "text", "texto", "texte", "титр", "타이틀", "tiêu đề", "标题"))
-    nombre_titulo = any(p in nombre for p in ("text+", "text plus", "fusion", "title", "titulo", "título", "subtitle", "subtítulo", "subtitulo", "plantilla", "template"))
-    return (_tiene_textplus(clip) or en_carpeta_plantillas or tipo_titulo or nombre_titulo or ruta.endswith((".setting", ".comp", ".drfx")))
+# Tipos que nunca son plantilla de subtítulos (audio, video, líneas,
+# generadores de ajuste, etc.).
+_TIPOS_NO_TEXTO = ("subtitle", "timeline", "multicam", "compound", "still",
+                   "audio", "video", "matte", "solid color")
+
+# Tipos que en Resolve sí llevan texto adentro.
+_TIPOS_CON_TEXTO = ("fusion title", "fusion titles", "title", "titulo", "título",
+                    "titre", "titel", "titolo", "text+", "text plus")
+
+_NOMBRES_CON_TEXTO = ("text+", "text plus", "texto", "text", "title", "titulo",
+                      "título", "titre", "titel", "titolo", "subtitle",
+                      "subtítulo", "subtitulo", "lower third", "caption",
+                      "crédito", "credito")
+
+_NOMBRES_NO_TEXTO = ("adjustment", "ajuste", "solid color", "color generator",
+                     "color bars", "noise", "blank", "transparent", "matte")
+
+
+def _es_plantilla_media_pool(clip, en_carpeta_plantillas=False, props=None):
+    """True sólo si el elemento puede llevar texto (Fusion Title o Text+).
+
+    Antes entraba cualquier cosa de tipo "generator" o cualquier clip que
+    estuviera dentro de una carpeta llamada "plantillas": por eso aparecían
+    capas de ajuste, luces y zooms que después no tienen dónde escribir el
+    subtítulo.
+    """
+    p = props if props is not None else _props_clip(clip)
+    tipo = p.get("type", "").lower()
+    ruta = p.get("file path", "").lower()
+    nombre = " ".join((p.get("clip name", ""), p.get("file name", ""),
+                       str(clip.GetName() or ""))).lower()
+    if any(x in tipo for x in _TIPOS_NO_TEXTO): return False
+    if any(x in nombre for x in _NOMBRES_NO_TEXTO): return False
+    if _tiene_textplus(clip): return True
+    if any(x in tipo for x in _TIPOS_CON_TEXTO): return True
+    if "generator" in tipo:
+        # "Text+" del Effects Library también es un Generator: sólo se acepta
+        # si el nombre dice que es texto.
+        return any(x in nombre for x in _NOMBRES_CON_TEXTO)
+    if "fusion" in tipo and en_carpeta_plantillas:
+        return True
+    if en_carpeta_plantillas:
+        if ruta.endswith((".setting", ".comp", ".drfx")): return True
+        return any(x in nombre for x in _NOMBRES_CON_TEXTO)
+    return False
 
 
 def _clips(carpeta, en_carpeta_plantillas, out, ruta=()):
     for c in carpeta.GetClipList() or []:
-        if not _es_plantilla_media_pool(c, en_carpeta_plantillas): continue
-        tipo = _propiedad_clip(c, "Type").lower()
-        ruta_archivo = _propiedad_clip(c, "File Path").lower()
+        props = _props_clip(c)
+        if not _es_plantilla_media_pool(c, en_carpeta_plantillas, props): continue
+        tipo = props.get("type", "").lower()
+        ruta_archivo = props.get("file path", "").lower()
         if "subtitle" in tipo or ruta_archivo.endswith(".srt"): continue
         etiqueta = " / ".join((*ruta, c.GetName()))
         out[etiqueta] = c
@@ -1008,9 +1066,27 @@ def _clips(carpeta, en_carpeta_plantillas, out, ruta=()):
         _clips(f, marcada, out, (*ruta, nombre))
 
 
-def plantillas():
+_PLANTILLAS_CACHE = {}
+_PLANTILLAS_T = 0.0
+PLANTILLAS_TTL = 20.0
+
+
+def plantillas(forzar=False):
+    """Lista de plantillas del Media Pool, con caché corta.
+
+    El recorrido completo tarda ~2,5 s en un pool grande. La app lo pedía
+    cada 5 segundos y eso se sentía como tirones; ahora se guarda 20 s y
+    sólo se recalcula al tocar ACTUALIZAR o cuando vence.
+    """
+    global _PLANTILLAS_CACHE, _PLANTILLAS_T
+    ahora = time.monotonic()
+    if (not forzar and _PLANTILLAS_CACHE
+            and (ahora - _PLANTILLAS_T) < PLANTILLAS_TTL):
+        return dict(_PLANTILLAS_CACHE)
     out = {}
     _clips(mp.GetRootFolder(), False, out)
+    _PLANTILLAS_CACHE = dict(out)
+    _PLANTILLAS_T = ahora
     return out
 
 
@@ -1019,38 +1095,85 @@ def _pista_activa(tipo, indice, activa):
     except Exception: return False
 
 
+_LOTE_INSERCION = 4
+
+
+def _textplus_de_item(item):
+    try:
+        comp = item.GetFusionCompByIndex(1)
+    except Exception:
+        comp = None
+    if not comp:
+        return None
+    try:
+        tools = comp.GetToolList(False, "TextPlus") or {}
+    except Exception:
+        return None
+    return next(iter(tools.values()), None)
+
+
+def _borrar_items(items):
+    items = [i for i in (items or []) if i is not None]
+    if not items:
+        return
+    try: timeline.DeleteClips(items)
+    except Exception: pass
+
+
 def aplicar_plantilla(tpl, bloques, f_ini, progreso, p_ini=92, p_fin=100):
+    """Inserta los títulos en tandas cortas, no de una sola vez.
+
+    Con cientos de subtítulos, una única llamada a AppendToTimeline deja a
+    Resolve y a la ventana congelados varios segundos (y además cada título
+    hay que abrirlo para escribirle el Text+). En tandas de ~4 el trabajo se
+    reparte, la barra avanza y la interfaz sigue respondiendo.
+
+    La primera tanda es de UN título: si la plantilla no tiene nodo Text+ se
+    avisa al instante, sin haber llenado la línea de clips inservibles.
+    """
+    if not bloques:
+        return True
+    fps = FPS or 24.0
     timeline.AddTrack("video")
     pista = timeline.GetTrackCount("video")
-    infos = []
-    for t, s, e in bloques:
-        if _cancelar_procesos.is_set(): raise RuntimeError("Proceso cancelado.")
-        dur = max(1, round((e - s) * FPS))
-        infos.append({"mediaPoolItem": tpl, "startFrame": 0, "endFrame": dur, "trackIndex": pista, "recordFrame": f_ini + round(s * FPS)})
-    items = mp.AppendToTimeline(infos) or []
-    if len(items) != len(bloques):
-        if items:
-            try: timeline.DeleteClips(items)
-            except Exception: pass
-        raise RuntimeError("Resolve no pudo insertar todos los títulos de la plantilla seleccionada.")
-    comps_tools = []
-    for it in items:
-        comp = it.GetFusionCompByIndex(1)
-        tools = comp.GetToolList(False, "TextPlus") if comp else {}
-        tool = next(iter((tools or {}).values()), None)
-        if tool is None:
-            try: timeline.DeleteClips(items)
-            except Exception: pass
-            raise RuntimeError("El elemento elegido no contiene un nodo Text+ editable. Elegí un clip de tipo Fusion Composition/Text+ del Media Pool.")
-        comps_tools.append(tool)
-        
-    for n, (tool, b) in enumerate(zip(comps_tools, bloques)):
-        tool.StyledText = b[0]
-        # Optimización: Actualizar la UI solo cada 15 elementos para evitar que Tkinter colapse
-        if n % 15 == 0 or n == len(items) - 1:
-            progreso(p_ini + (p_fin - p_ini) * n / max(1, len(items)), "Aplicando plantilla...")
-            
-    return len(items) == len(bloques)
+    total = len(bloques)
+    insertados = []
+    hechos = 0
+    primera = True
+
+    while hechos < total:
+        if _cancelar_procesos.is_set():
+            _borrar_items(insertados)
+            raise RuntimeError("Proceso cancelado.")
+        tam = 1 if primera else min(_LOTE_INSERCION, total - hechos)
+        tramo = bloques[hechos:hechos + tam]
+        infos = [{"mediaPoolItem": tpl, "startFrame": 0,
+                  "endFrame": max(1, round((e - s) * fps)),
+                  "trackIndex": pista, "recordFrame": f_ini + round(s * fps)}
+                 for _, s, e in tramo]
+        items = mp.AppendToTimeline(infos) or []
+        if len(items) != len(tramo):
+            _borrar_items(insertados + list(items))
+            raise RuntimeError("Resolve no pudo insertar todos los títulos de la plantilla seleccionada.")
+        insertados.extend(items)
+
+        for item, (texto, _, _) in zip(items, tramo):
+            tool = _textplus_de_item(item)
+            if tool is None:
+                _borrar_items(insertados)
+                raise RuntimeError(
+                    "El elemento elegido no contiene un nodo Text+ editable. "
+                    "Elegí una plantilla de tipo Fusion Title o Text+ del Media Pool.")
+            tool.StyledText = texto
+
+        hechos += tam
+        primera = False
+        progreso(p_ini + (p_fin - p_ini) * hechos / total,
+                 "Insertando subtítulos en la línea...")
+        # Deja que Resolve y Tkinter respiren entre tandas.
+        time.sleep(0.005)
+
+    return len(insertados) == total
 
 
 def carpeta_subtitulos():
@@ -1384,8 +1507,8 @@ class Backend:
             else: detalle = "sin clips"
             salida.append({"n": n, "label": f"A{n}", "clips": len(items), "titulo": titulo or "Sin clips", "detalle": detalle, "derecha": ("VACÍA" if not items else f"{len(items)} CLIP{'S' if len(items) != 1 else ''}")})
         return salida
-    def plantillas(self):
-        nombres = sorted(plantillas().keys(), key=lambda s: s.lower())
+    def plantillas(self, forzar=False):
+        nombres = sorted(plantillas(forzar=forzar).keys(), key=lambda s: s.lower())
         return [SOLO] + nombres
     def correr(self, cfg, progreso):
         # Una cancelación anterior no debe impedir el próximo trabajo.
@@ -1396,6 +1519,14 @@ class Backend:
         if nombre_tpl != SOLO:
             try: item = plantillas().get(nombre_tpl)
             except Exception: item = None
+            if item is None:
+                # Puede ser que la caché todavía no tenga la plantilla nueva.
+                try: item = plantillas(forzar=True).get(nombre_tpl)
+                except Exception: item = None
+            if item is None:
+                raise RuntimeError(
+                    "La plantilla elegida ya no está en el Media Pool. "
+                    "Tocá ACTUALIZAR y elegí otra.")
         cfg["plantilla"] = item
         generar(cfg, progreso)
     def cancelar(self): cerrar_procesos()
