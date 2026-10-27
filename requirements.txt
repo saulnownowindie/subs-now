@@ -1,6 +1,11 @@
-av==19.0.2
-ctranslate2==4.8.3
-faster-whisper==1.2.1
-numpy==2.5.4
-pillow==13.0.0
-python-docx==1.2.0
+# Indie Now · Subtítulos — dependencias de ejecución
+# Instaladas automáticamente por INSTALAR.bat en %LOCALAPPDATA%\IndieDL\venv
+# (se comparte con Indie Now DL si ya está instalado).
+
+faster-whisper>=1.1
+ctranslate2>=4.4
+av>=12
+tokenizers>=0.20
+numpy>=1.26
+pillow>=10
+python-docx>=1.1

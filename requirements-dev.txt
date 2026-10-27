@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Solo para generar el .exe con compilar.bat
+pyinstaller>=6.10

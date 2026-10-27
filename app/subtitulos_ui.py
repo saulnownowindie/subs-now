@@ -13,7 +13,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, font as tkfont, messagebox
 
 import indie_ui as iu
 
@@ -120,11 +120,13 @@ class TrackRow(tk.Frame):
                               fg=iu.YEL, font=(iu.F_BLACK, 9), padx=8, pady=3)
         self.badge.grid(row=0, column=1, padx=(10, 12), pady=9)
 
-        self.name = tk.Label(self, text=_corto(data.get("titulo") or "Sin clips", 58),
-                             bg=iu.SURFACE_2,
+        self._full_name = str(data.get("titulo") or "Sin clips")
+        self._name_font = tkfont.Font(font=(iu.F_SEMI, 10))
+        self.name = tk.Label(self, text=self._full_name, bg=iu.SURFACE_2,
                              fg=iu.TEXT if self._enabled else iu.DIM,
                              font=(iu.F_SEMI, 10), anchor="w", justify="left")
         self.name.grid(row=0, column=2, sticky="ew", pady=(8, 1))
+        self.name.bind("<Configure>", self._fit_name, add="+")
 
         self.meta = tk.Label(self, text=data.get("detalle") or "vacía",
                              bg=iu.SURFACE_2, fg=iu.DIM, font=(iu.F_BODY, 8),
@@ -145,6 +147,28 @@ class TrackRow(tk.Frame):
         except Exception:
             pass
         self._paint()
+
+    def _fit_name(self, event=None):
+        """Recorta el nombre de la pista con «…» según el ancho disponible."""
+        try:
+            avail = int(event.width if event is not None else self.name.winfo_width()) - 2
+        except Exception:
+            return
+        if avail < 40:
+            return
+        if avail == getattr(self, "_fit_avail", -1):
+            return
+        self._fit_avail = avail
+        texto = self._full_name
+        try:
+            if self._name_font.measure(texto) <= avail:
+                self.name.configure(text=texto)
+                return
+            while texto and self._name_font.measure(texto + "…") > avail:
+                texto = texto[:-1]
+        except tk.TclError:
+            return
+        self.name.configure(text=(texto.rstrip() + "…") if texto else "…")
 
     def _set_hover(self, on):
         if not self._enabled:
@@ -178,6 +202,7 @@ class TrackRow(tk.Frame):
 
 class SubtitulosApp:
     def __init__(self, root, backend):
+        self._boot_t0 = time.perf_counter()
         self.root = root
         self.backend = backend
         self.cfg = dict(backend.config() or {})
@@ -186,6 +211,15 @@ class SubtitulosApp:
         self.track_rows = []
         self._signature_pistas = None
         self._busy = False
+        self._closing = False
+        self._revealed = False
+        self._alpha_ok = True
+        self._cancelando = False
+        self._banner_w = 0
+        self._job_reveal = None
+        self._state_reading = False
+        self._template_reading = False
+        self._last_template_scan = 0.0
         self._job_header = None
         self._job_watch = None
         self._pulse = None
@@ -197,6 +231,8 @@ class SubtitulosApp:
         self._lab_idioma = {code: eti for code, eti in IDIOMAS_AUDIO}
         self._cod_destino = {eti: code for code, eti in IDIOMAS_DESTINO}
         self._lab_destino = {code: eti for code, eti in IDIOMAS_DESTINO}
+        
+        self.v_ready = tk.BooleanVar(value=False)
 
         self.v_guion = tk.StringVar(value=self.cfg.get("guion", "") or "")
         self.v_srt = tk.StringVar(value=self.cfg.get("srt", "") or "")
@@ -242,26 +278,115 @@ class SubtitulosApp:
         self._build_estado()
         self._build_log()
 
-        self._set_estado("idle", "Leyendo la timeline de Resolve…")
-        self._fade_in()
-        self.root.after(40, self._arranque)
+        self._set_estado("idle", "Listo.")
+        self.root.after(0, self._arranque)
+
+    # ---- arranque visual ----
+    def _mark(self, tag):
+        if os.environ.get("INDIEDL_PROFILE"):
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "subtitulos.log"), "a", encoding="utf-8") as f:
+                    f.write(f"boot {tag} "
+                            f"{int((time.perf_counter() - self._boot_t0) * 1000)} ms\n")
+            except Exception:
+                pass
 
     def _arranque(self):
-        """Primer lectura de Resolve, después de que la ventana ya se dibujó."""
-        self._refresh_timeline(force=True)
+        """Primera lectura de Resolve, ya con la ventana armada fuera de pantalla."""
+        self._mark("build")
         self._sync_modo()
-        if self.timeline:
-            self._set_estado(
-                "idle", f"Listo. Se va a trabajar sobre «{self.timeline['nombre']}».")
-        else:
-            self._set_estado("idle", "Listo. Abrí una timeline en Resolve.")
         self._log("Aplicación iniciada · estética IndieDL", "info")
+        self._request_state_refresh(force=True)
         self._poll()
         self._watch()
+        self.root.after(20, lambda: self._reveal(0))
 
-    # ─────────────────────────────────────────────────────────
-    # VENTANA / CABECERA / PIE
-    # ─────────────────────────────────────────────────────────
+    def _reveal(self, waited=0):
+        """Muestra la ventana completa y recién ahí la funde a opacidad total.
+
+        Se espera la primera lectura de Resolve (normalmente <150 ms) para que
+        la ventana no aparezca con guiones ni textos de espera; si Resolve
+        tarda, se muestra igual a los ~400 ms y la lectura se aplica después.
+        """
+        if self._closing:
+            return
+        if not self.v_ready.get() and waited < 400:
+            self._job_reveal = self.root.after(20, lambda: self._reveal(waited + 20))
+            return
+        self._job_reveal = None
+        self._mark("ready")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        self._draw_banner(max(320, self.root.winfo_width()))
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            self.root.deiconify()
+            self._apply_dark_titlebar()
+            self.root.lift()
+        except Exception:
+            pass
+        # Primer dibujo completo todavía invisible: cuando la ventana se deja
+        # ver, ya está armada (sin fotogramas a medio pintar).
+        try:
+            self.root.update()
+        except Exception:
+            pass
+        self._mark("painted")
+        if self._alpha_ok:
+            self._fade_in(0)
+        else:
+            self._finish_reveal()
+
+    def _fade_in(self, step):
+        # Pocos pasos: cada cambio de alfa repinta la ventana entera en Windows.
+        steps = 3
+        p = min(1.0, float(step) / steps)
+        alpha = 1.0 - (1.0 - p) ** 2.2
+        try:
+            self.root.attributes("-alpha", alpha)
+        except tk.TclError:
+            self._alpha_ok = False
+        if step < steps:
+            self.root.after(18, lambda: self._fade_in(step + 1))
+        else:
+            self._finish_reveal()
+
+    def _finish_reveal(self):
+        if self._revealed:
+            return
+        self._revealed = True
+        try:
+            self.root.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self._mark("visible")
+
+    def _apply_dark_titlebar(self):
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) \
+                or self.root.winfo_id()
+            value = ctypes.c_int(1)
+            for attr in (20, 19):  # Win10/11 immersive dark mode
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value),
+                        ctypes.sizeof(value)) == 0:
+                    break
+        except Exception:
+            pass
+
     def _config_root(self):
         r = self.root
         r.title("Indie Now · Subtítulos")
@@ -290,28 +415,41 @@ class SubtitulosApp:
         tk.Label(band, text="SUBTÍTULOS   ·   TRANSCRIPCIÓN   ·   DAVINCI RESOLVE",
                  bg=iu.BLACK, fg=iu.YEL, font=(iu.F_BLACK, 11)).pack(expand=True)
         tk.Frame(self.header, bg=iu.YEL, height=4).pack(fill="x")
-        self._draw_banner(max(320, self.root.winfo_width()))
+        # El banner se dibuja en _reveal(), con el ancho real de la ventana:
+        # así no se ve cambiar de tamaño un instante después de aparecer.
         self.root.bind("<Configure>", self._on_root_resize, add="+")
 
     def _on_root_resize(self, event=None):
         if event is not None and event.widget is not self.root:
+            return
+        # Se cuantiza acá (y no en _draw_banner) para comparar manzanas con manzanas.
+        width = -(-max(320, self.root.winfo_width()) // 32) * 32
+        if width == self._banner_w:
             return
         if self._job_header:
             try:
                 self.root.after_cancel(self._job_header)
             except Exception:
                 pass
-        self._job_header = self.root.after(140, lambda: self._draw_banner(
-            max(320, self.root.winfo_width())))
+        self._job_header = self.root.after(90, lambda: self._draw_banner(width))
 
     def _draw_banner(self, width):
         self._job_header = None
+        # Se cuantiza el ancho a múltiplos de 32 px: redimensionar la ventana
+        # no regenera el halftone en cada píxel (cada render cuesta ~15 ms).
+        width = max(320, int(width))
+        width = -(-width // 32) * 32
+        if width == self._banner_w and getattr(self, "_banner_photo", None):
+            self.banner.configure(image=self._banner_photo)
+            return
         try:
             photo = iu.banner_photo(width, 104)
         except Exception:
             photo = None
         if photo is None:
             return
+        self._banner_w = width
+        self._banner_photo = photo
         self.banner.configure(image=photo)
         self.banner._photo = photo
 
@@ -333,10 +471,13 @@ class SubtitulosApp:
                                   icon="▶", command=self._go)
         self.cta.pack(side="right", padx=(16, 0))
         self.cta.configure(width=300)
+        # Aparece sólo mientras hay un proceso en curso, a la izquierda del CTA.
+        self.btn_cancel = iu.BrandButton(row, text="CANCELAR", kind="danger",
+                                         height=54, font=(iu.F_BLACK, 12),
+                                         radius=11, icon="■",
+                                         command=self._cancelar)
+        self.btn_cancel.configure(width=170)
 
-    # ─────────────────────────────────────────────────────────
-    # CUERPO
-    # ─────────────────────────────────────────────────────────
     def _build_scroll(self):
         self.scroll = iu.ScrollArea(self.root, bg=iu.BG, pad=22)
         self.scroll.pack(fill="both", expand=True)
@@ -390,7 +531,7 @@ class SubtitulosApp:
         left.pack(side="left", fill="x", expand=True)
         tk.Label(left, text="TRABAJANDO EN ESTA TIMELINE", bg=iu.SURFACE,
                  fg=iu.DIM, font=(iu.F_BLACK, 8)).pack(anchor="w")
-        self.lbl_tl = tk.Label(left, text="—", bg=iu.SURFACE, fg=iu.TEXT,
+        self.lbl_tl = tk.Label(left, text="—", bg=iu.SURFACE, fg=iu.DIM,
                                font=(iu.F_BLACK, 19), anchor="w", justify="left")
         self.lbl_tl.pack(anchor="w", pady=(2, 0))
         self.lbl_tl_sub = tk.Label(left, text="", bg=iu.SURFACE, fg=iu.MUTED,
@@ -400,11 +541,10 @@ class SubtitulosApp:
         right.pack(side="right", anchor="ne")
         self.dot = iu.PulseDot(right, bg=iu.SURFACE)
         self.dot.pack(side="left", padx=(0, 6))
-        self.lbl_live = tk.Label(right, text="EN VIVO", bg=iu.SURFACE,
-                                 fg=iu.GREEN, font=(iu.F_BLACK, 8))
+        self.lbl_live = tk.Label(right, text="CONECTANDO", bg=iu.SURFACE,
+                                 fg=iu.DIM, font=(iu.F_BLACK, 8))
         self.lbl_live.pack(side="left")
 
-    # ── 1. ACCIONES ──────────────────────────────────────────
     def _build_actions(self):
         card, body, hint = self._section(self.col_left, 1, "QUÉ QUERÉS HACER", "MODO")
         self.hint_acciones = hint
@@ -421,7 +561,6 @@ class SubtitulosApp:
                                       self.v_solo, command=self._solo_changed)
         self.chk_solo.pack(fill="x", pady=(6, 0))
 
-    # ── 2. AUDIO ─────────────────────────────────────────────
     def _build_audio(self):
         card, body, hint = self._section(self.col_left, 2, "AUDIO Y RANGO", "PISTAS")
         self.hint_audio = hint
@@ -473,7 +612,6 @@ class SubtitulosApp:
             font=(iu.F_BLACK, 9))
         self.seg_rango.pack(fill="x")
 
-    # ── 3. GUION ─────────────────────────────────────────────
     def _build_guion(self):
         card, body, hint = self._section(self.col_right, 3, "GUION", "OPCIONAL")
         self.hint_guion = hint
@@ -500,9 +638,9 @@ class SubtitulosApp:
                                         radius=8, icon="▤", command=self._elegir_guion)
         self.btn_guion.pack(side="right")
 
-    # ── 4. SALIDA ────────────────────────────────────────────
     def _build_salida(self):
         card, body, hint = self._section(self.col_right, 4, "DÓNDE GUARDAR", "SRT + TXT")
+        self.hint_salida = hint
         row = tk.Frame(body, bg=iu.SURFACE)
         row.pack(fill="x")
         info = tk.Frame(row, bg=iu.SURFACE)
@@ -525,7 +663,6 @@ class SubtitulosApp:
                                       radius=8, icon="▣", command=self._elegir_srt)
         self.btn_srt.pack(side="right")
 
-    # ── 5. PLANTILLA ─────────────────────────────────────────
     def _build_plantilla(self):
         card, body, hint = self._section(self.col_right, 5, "PLANTILLA", "MEDIA POOL")
         self.hint_tpl = hint
@@ -543,7 +680,6 @@ class SubtitulosApp:
         self.lbl_tpl_note.pack(fill="x", pady=(8, 0))
         iu.autowrap(self.lbl_tpl_note, extra=10)
 
-    # ── 6. TRADUCCIÓN ────────────────────────────────────────
     def _build_traduccion(self):
         card, body, hint = self._section(self.col_right, 6, "TRADUCCIÓN", "GOOGLE")
         self.hint_trad = hint
@@ -576,7 +712,6 @@ class SubtitulosApp:
         self.lbl_trad_note.pack(fill="x", pady=(8, 0))
         iu.autowrap(self.lbl_trad_note, extra=10)
 
-    # ── ESTADO ───────────────────────────────────────────────
     def _build_estado(self):
         card = self._card(self.host_state, pady=(0, 12))
         body = card.body
@@ -599,7 +734,6 @@ class SubtitulosApp:
         self.lbl_estado.pack(fill="x", pady=(2, 0))
         iu.autowrap(self.lbl_estado, extra=60)
 
-    # ── LOG ──────────────────────────────────────────────────
     def _build_log(self):
         card, body, hint = self._section(self.host_log, None, "REGISTRO EN TIEMPO REAL", "LOG")
         self.hint_log = hint
@@ -640,13 +774,27 @@ class SubtitulosApp:
         if self._log_open:
             self.log_console.pack(fill="x")
             self.btn_log_toggle.set_text("OCULTAR REGISTRO")
+            # Que el registro quede a la vista, sin que el usuario tenga que buscarlo.
+            self.root.after(90, self._scroll_to_log)
         else:
             self.log_console.pack_forget()
             self.btn_log_toggle.set_text("VER REGISTRO")
 
-    # ─────────────────────────────────────────────────────────
-    # ESTADO / CONFIG
-    # ─────────────────────────────────────────────────────────
+    def _scroll_to_log(self):
+        if not self._log_open or self._closing:
+            return
+        try:
+            top = self.log_console.winfo_rooty()
+            bottom = top + self.log_console.winfo_height()
+            vtop = self.scroll.canvas.winfo_rooty()
+            vbottom = vtop + self.scroll.canvas.winfo_height()
+            delta = top - self.content.winfo_rooty()
+        except tk.TclError:
+            return
+        if vtop <= top and bottom <= vbottom:
+            return  # ya se ve completo: no movemos nada
+        self.scroll.scroll_to(max(0, delta - 90))
+
     def _set_estado(self, kind, mensaje, titulo=None):
         conf = ESTADOS.get(kind, ESTADOS["idle"])
         self.icono_estado.draw(kind)
@@ -663,7 +811,6 @@ class SubtitulosApp:
             pass
 
     def _log(self, mensaje, kind="info"):
-        """Consola con hora + color. kind: info|ok|err|cmd."""
         if not hasattr(self, "log"):
             return
         texto = str(mensaje).strip()
@@ -686,8 +833,6 @@ class SubtitulosApp:
             pass
 
     def _log_scroll(self, first, last):
-        # La barra ocupa siempre el mismo ancho (si aparece/desaparece, el
-        # Text cambia de ancho y parpadea al hacer scroll).
         self.log_bar.set(first, last)
 
     def _limpiar_log(self):
@@ -721,15 +866,43 @@ class SubtitulosApp:
         except Exception:
             pass
 
-    # ─────────────────────────────────────────────────────────
-    # TIMELINE / PISTAS / PLANTILLAS
-    # ─────────────────────────────────────────────────────────
     def _refresh_timeline(self, force=False):
-        info = None
-        try:
-            info = self.backend.info_timeline()
-        except Exception as exc:
-            self._log(f"No pude leer la timeline: {exc}", "err")
+        self._request_state_refresh(force=force)
+
+    def _request_state_refresh(self, force=False):
+        if self._closing or self._state_reading:
+            return
+        self._state_reading = True
+        nombre_anterior = (self.timeline or {}).get("nombre")
+
+        def leer_estado():
+            try:
+                info = self.backend.info_timeline()
+                error = None
+            except Exception as exc:
+                info, error = None, f"No pude leer la timeline: {exc}"
+            try:
+                pistas = list(self.backend.pistas() or []) if info else []
+            except Exception as exc:
+                pistas = []
+                error = error or f"No pude leer las pistas de audio: {exc}"
+            cambio = force or nombre_anterior != (info or {}).get("nombre")
+            plantillas = None
+            if cambio:
+                try:
+                    plantillas = list(self.backend.plantillas() or []) if info else []
+                except Exception as exc:
+                    error = error or f"No pude leer las plantillas: {exc}"
+                    plantillas = []
+            self._cola.put(("estado", info, pistas, plantillas, force, error))
+
+        threading.Thread(target=leer_estado, daemon=True).start()
+
+    def _aplicar_estado(self, info, pistas, plantillas, force=False, error=None):
+        if self._closing:
+            return
+        if error:
+            self._log(error, "err")
         anterior = (self.timeline or {}).get("nombre")
         self.timeline = info
         if info:
@@ -742,9 +915,16 @@ class SubtitulosApp:
             self.lbl_tl_sub.configure(text="Abrí una timeline en Resolve; se detecta sola.")
             self.lbl_live.configure(text="SIN SEÑAL", fg=iu.RED)
         cambio = force or (anterior != (info or {}).get("nombre"))
-        self._refresh_pistas(reiniciar=cambio)
-        if cambio:
-            self._refrescar_plantillas(silencioso=True)
+        self._actualizar_pistas(pistas, reiniciar=cambio)
+        if plantillas is not None:
+            self._actualizar_plantillas(plantillas)
+        if info and (cambio or force):
+            self._set_estado("idle", f"Listo. Se va a trabajar sobre «{info['nombre']}».")
+        elif not info:
+            self._set_estado("idle", "Listo. Abrí una timeline en Resolve.")
+            
+        if not self.v_ready.get():
+            self.v_ready.set(True)
 
     def _refresh_pistas(self, reiniciar=False):
         try:
@@ -752,6 +932,9 @@ class SubtitulosApp:
         except Exception as exc:
             self._log(f"No pude leer las pistas de audio: {exc}", "err")
             pistas = []
+        self._actualizar_pistas(pistas, reiniciar)
+
+    def _actualizar_pistas(self, pistas, reiniciar=False):
         self._pistas = pistas
         firma = tuple((p.get("n"), p.get("clips"), p.get("titulo")) for p in pistas)
         validas = {p["n"] for p in pistas if p.get("clips")}
@@ -815,31 +998,38 @@ class SubtitulosApp:
                 text="Elegí al menos una pista para transcribir.")
         elif len(elegidas) == 1:
             self.lbl_audio_note.configure(
-                text=f"{elegidas[0]['label']} · «{elegidas[0]['titulo']}»")
+                text=f"{elegidas[0]['label']} · «{_corto(elegidas[0]['titulo'], 64)}»")
         else:
             labels = " + ".join(d["label"] for d in elegidas)
             self.lbl_audio_note.configure(
                 text=f"{labels} · se mezclan en un solo audio antes de transcribir.")
 
     def _refrescar_plantillas(self, silencioso=False):
-        try:
-            valores = list(self.backend.plantillas() or [])
-        except Exception as exc:
-            self._log(f"No pude leer las plantillas: {exc}", "err")
-            valores = []
+        if self._closing or self._template_reading:
+            return
+        self._template_reading = True
+        if not silencioso:
+            self.btn_tpl.set_enabled(False)
+            self.btn_tpl.set_text("LEYENDO…", icon="↻")
+            self._set_estado("working", "Leyendo plantillas del Media Pool…")
+
+        def leer_plantillas():
+            try:
+                valores = list(self.backend.plantillas() or [])
+                error = None
+            except Exception as exc:
+                valores, error = [], f"No pude leer las plantillas: {exc}"
+            self._cola.put(("plantillas", valores, silencioso, error))
+
+        threading.Thread(target=leer_plantillas, daemon=True).start()
+
+    def _actualizar_plantillas(self, valores):
         self.tpls = valores
         actual = self.v_tpl.get()
         self.sel_tpl.set_values(valores)
         if valores and actual not in valores:
             self.v_tpl.set(valores[0])
-        if not silencioso:
-            cantidad = max(0, len(valores) - 1)
-            self._log(f"{cantidad} candidatos Text+/Fusion detectados en el Media Pool.", "info")
-            self._set_estado("idle", f"{cantidad} candidatos de plantilla disponibles en el Media Pool.")
 
-    # ─────────────────────────────────────────────────────────
-    # MODOS
-    # ─────────────────────────────────────────────────────────
     def _solo_changed(self):
         if self.v_solo.get():
             self.v_subs.set(False)
@@ -952,11 +1142,28 @@ class SubtitulosApp:
             nombre = self.timeline["nombre"] if self.timeline else "timeline"
             self.lbl_srt.configure(text=_corto(f"{nombre}.srt", 52), fg=iu.MUTED)
             self.lbl_srt_dir.configure(
-                text="Se guarda junto al guion o en Documentos.", fg=iu.DIM)
+                text="El .txt se guarda al lado, con el mismo nombre.",
+                fg=iu.DIM)
+        self._hint_txt()
 
-    # ─────────────────────────────────────────────────────────
-    # ACCIONES DE ARCHIVO
-    # ─────────────────────────────────────────────────────────
+    def _hint_txt(self):
+        """Muestra en el chip del panel qué archivo .txt se va a escribir."""
+        hint = getattr(self, "hint_salida", None)
+        if hint is None:
+            return
+        try:
+            if not self.v_txt.get():
+                hint.configure(text="SRT + TXT")
+                return
+            srt = self.v_srt.get()
+            if srt:
+                base = os.path.splitext(os.path.basename(srt))[0]
+                hint.configure(text=_corto(f"{base}_transcripcion.txt", 36).upper())
+            else:
+                hint.configure(text="TXT JUNTO AL SRT")
+        except tk.TclError:
+            pass
+
     def _elegir_guion(self):
         p = filedialog.askopenfilename(
             title="Seleccionar guion",
@@ -1003,9 +1210,6 @@ class SubtitulosApp:
         except Exception as exc:
             self._log(f"No pude abrir la carpeta: {exc}", "err")
 
-    # ─────────────────────────────────────────────────────────
-    # EJECUCIÓN
-    # ─────────────────────────────────────────────────────────
     def _go(self):
         if self._busy:
             return
@@ -1026,7 +1230,6 @@ class SubtitulosApp:
             messagebox.showwarning("Sin audio",
                                    "Elegí al menos una pista de audio en «2. AUDIO Y RANGO».")
             return
-        self._refresh_timeline()
         if not self.timeline:
             messagebox.showerror("Sin timeline",
                                  "No hay ninguna timeline abierta en Resolve.")
@@ -1050,8 +1253,12 @@ class SubtitulosApp:
                             else "frases"),
         }
         self._busy = True
+        self._cancelando = False
         self.cta.set_enabled(False)
         self.cta.set_text("PROCESANDO…")
+        self.btn_cancel.set_enabled(True)
+        self.btn_cancel.set_text("CANCELAR")
+        self.btn_cancel.pack(side="right", padx=(12, 0))
         self.meter.set(0, animate=False)
         self._set_estado("working", f"Iniciando proceso para «{self.timeline['nombre']}»…")
         self._log(f"── Inicio · «{self.timeline['nombre']}» · "
@@ -1089,12 +1296,37 @@ class SubtitulosApp:
                         self._set_estado("working", msg)
                     self._log(msg, "info")
                 elif evento[0] == "error":
-                    self._set_estado("error", evento[1])
-                    self._log("ERROR · " + evento[1], "err")
+                    if self._cancelando:
+                        self._set_estado("warn", "Cancelado. No se guardó nada.")
+                        self._log("Proceso cancelado por el usuario.", "cmd")
+                    else:
+                        self._set_estado("error", evento[1])
+                        self._log("ERROR · " + evento[1], "err")
                     self.meter.set(0, animate=False)
                     self._fin_trabajo()
                 elif evento[0] == "fin":
                     self._fin_trabajo()
+                elif evento[0] == "estado":
+                    _, info, pistas, plantillas, force, error = evento
+                    self._state_reading = False
+                    self._aplicar_estado(info, pistas, plantillas, force, error)
+                elif evento[0] == "plantillas":
+                    _, valores, silencioso, error = evento
+                    self._template_reading = False
+                    if not silencioso:
+                        usa_plantilla = self.v_subs.get() and not self.v_solo.get()
+                        self.btn_tpl.set_enabled(usa_plantilla)
+                        self.btn_tpl.set_text("ACTUALIZAR", icon="↻")
+                    if error:
+                        self._log(error, "err")
+                        self._set_estado("error", error)
+                    self._actualizar_plantillas(valores)
+                    if not silencioso and not error:
+                        cantidad = max(0, len(valores) - 1)
+                        self._log(f"{cantidad} candidatos Text+/Fusion detectados en el Media Pool.", "info")
+                        if cantidad > 0:
+                            self._log("Plantillas: " + " | ".join(valores[1:]), "info")
+                        self._set_estado("idle", f"{cantidad} candidatos de plantilla disponibles en el Media Pool.")
         except queue.Empty:
             pass
         except tk.TclError:
@@ -1106,61 +1338,62 @@ class SubtitulosApp:
 
     def _fin_trabajo(self):
         self._busy = False
+        self._cancelando = False
+        self.btn_cancel.pack_forget()
         self.cta.set_enabled(True)
         self.cta.set_text(self._texto_boton())
         self._log("Proceso finalizado; el botón volvió a estar disponible.", "info")
 
+    def _cancelar(self):
+        if not self._busy or self._cancelando:
+            return
+        if not messagebox.askyesno(
+                "Cancelar el proceso",
+                "¿Detener la transcripción en curso?\n\n"
+                "Lo que ya se generó no se guarda.", parent=self.root):
+            return
+        if not self._busy:   # pudo terminar mientras el diálogo estaba abierto
+            return
+        self._cancelando = True
+        self.btn_cancel.set_enabled(False)
+        self.btn_cancel.set_text("CANCELANDO…")
+        self._set_estado("warn", "Cancelando el proceso…")
+        self._log("Cancelación pedida por el usuario.", "cmd")
+        threading.Thread(target=self.backend.cancelar, daemon=True).start()
+
     def _watch(self):
+        if self._closing:
+            return
         if not self._busy:
-            antes = (self.timeline or {}).get("nombre")
-            self._refresh_timeline()
-            ahora = (self.timeline or {}).get("nombre")
-            if antes and ahora and antes != ahora:
-                self._log(f"Cambiaste de timeline: «{ahora}»", "cmd")
-                self._set_estado("idle", f"Ahora trabajás sobre «{ahora}».")
+            self._request_state_refresh()
+            ahora = time.monotonic()
+            if ahora - self._last_template_scan >= 5.0:
+                self._last_template_scan = ahora
+                self._refrescar_plantillas(silencioso=True)
             self._actualizar_rutas()
         try:
             self._job_watch = self.root.after(2500, self._watch)
         except tk.TclError:
             pass
 
-    # ─────────────────────────────────────────────────────────
-    # CIERRE / ANIMACIÓN
-    # ─────────────────────────────────────────────────────────
     def cerrar(self):
+        if self._closing:
+            return
+        self._closing = True
         self._guardar()
-        if self._busy:
-            if not messagebox.askyesno(
-                    "Proceso en curso",
-                    "La generación todavía está trabajando.\n\n"
-                    "Si cerrás ahora se detendrán FFmpeg/FFprobe.\n\n¿Seguro?"):
-                return
-        try:
-            self.backend.cancelar()
-        except Exception:
-            pass
+        for nombre in ("_job_header", "_job_watch", "_pulse", "_job_reveal"):
+            job = getattr(self, nombre, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
         try:
             self.root.destroy()
         except tk.TclError:
             pass
+        threading.Thread(target=self.backend.cancelar, daemon=True).start()
 
-    def _fade_in(self):
-        try:
-            self.root.attributes("-alpha", 0.0)
-        except tk.TclError:
-            return
-
-        def step(alpha=0.0):
-            alpha = min(1.0, alpha + 0.16)
-            try:
-                self.root.attributes("-alpha", alpha)
-                if alpha < 1.0:
-                    self.root.after(16, lambda: step(alpha))
-            except tk.TclError:
-                pass
-        self.root.after(10, step)
-
-    # el atributo se crea al final para que _progreso pueda usarlo
     @property
     def _cola(self):
         if not hasattr(self, "_cola_obj"):

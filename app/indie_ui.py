@@ -11,6 +11,7 @@ antialias y el banner halftone) y animaciones con `after`.
 from __future__ import annotations
 
 import math
+import time
 import tkinter as tk
 from collections import OrderedDict
 from tkinter import font as tkfont
@@ -720,10 +721,18 @@ class BrandSelect(tk.Canvas):
         self._hover = False
         self._enabled = True
         self._size = (0, 0)
+        
+        # IDs de los eventos para poder limpiarlos luego
+        self._root_click_id = None
+        self._root_config_id = None
+        self._root_wheel_id = None
+        self._root_unmap_id = None
+        
         self.bind("<Configure>", self._on_configure)
         self.bind("<Enter>", lambda e: self._hov(True))
         self.bind("<Leave>", lambda e: self._hov(False))
-        self.bind("<Button-1>", lambda e: self._open())
+        self.bind("<ButtonRelease-1>", self._open)
+        
         try:
             variable.trace_add("write", lambda *_: self._draw())
         except Exception:
@@ -775,90 +784,109 @@ class BrandSelect(tk.Canvas):
         if photo is not None:
             self.create_image(0, 0, anchor="nw", image=photo)
         else:
-            round_rect_item(self, 1, 1, w - 1, h - 1, 9, fill=fill,
-                            outline=border)
+            round_rect_item(self, 1, 1, w - 1, h - 1, 9, fill=fill, outline=border)
         text = self.variable.get() or "—"
         if len(text) > 46:
             text = text[:45] + "…"
-        self.create_text(14, h // 2 - 1, text=text, anchor="w", fill=fg,
-                         font=self._font)
+        self.create_text(14, h // 2 - 1, text=text, anchor="w", fill=fg, font=self._font)
         self.create_text(w - 16, h // 2 - 2, text="▾", anchor="e", fill=arrow,
                          font=(F_BODY, 12, "bold"))
 
-    def _close(self):
+    def _close(self, event=None):
         if self._popup is not None:
-            try:
-                self._popup.grab_release()
-            except Exception:
-                pass
             try:
                 self._popup.destroy()
             except Exception:
                 pass
             self._popup = None
+            
+            # Desvincular todos los eventos que agregamos a la ventana raíz
+            root = self.winfo_toplevel()
+            for event_name, bind_id in [
+                ("<Button-1>", self._root_click_id),
+                ("<Configure>", self._root_config_id),
+                ("<Unmap>", self._root_unmap_id)
+            ]:
+                if bind_id:
+                    try:
+                        root.unbind(event_name, bind_id)
+                    except Exception:
+                        pass
+            # Ojo: NUNCA unbind_all("<MouseWheel>"), borraría el scroll global.
             try:
-                self.unbind_all("<Button-1>")
-                self.unbind_all("<Escape>")
-            except Exception:
+                _WHEEL_CLOSERS.remove(self)
+            except ValueError:
                 pass
+            
+            self._root_click_id = None
+            self._root_config_id = None
+            self._root_wheel_id = None
+            self._root_unmap_id = None
 
-    def _open(self):
+    def _global_click(self, event):
+        if self._popup:
+            w = event.widget
+            if w != self._popup and w.winfo_toplevel() != self._popup and w != self:
+                self._close()
+
+    def _open(self, event=None):
         if self._popup is not None or not self._values or not self._enabled:
             return
-        top = tk.Toplevel(self)
-        top.overrideredirect(True)
-        top.configure(bg=BORDER)
-        top.attributes("-topmost", True)
-        holder = tk.Frame(top, bg=SURFACE)
-        holder.pack(fill="both", expand=True, padx=1, pady=1)
-        rows = min(len(self._values), 12)
-        for value in self._values[:rows]:
-            selected = value == self.variable.get()
-            row = tk.Label(holder, text=("●  " if selected else "    ") + value,
-                           bg=SURFACE_2 if selected else SURFACE,
-                           fg=YEL if selected else TEXT,
-                           font=(F_SEMI, 10), anchor="w", padx=12, pady=8)
-            row.pack(fill="x")
-            row.bind("<Enter>", lambda e, r=row: r.configure(bg=FIELD, fg=YEL))
-            row.bind("<Leave>", lambda e, r=row, s=selected: r.configure(
-                bg=SURFACE_2 if s else SURFACE, fg=YEL if s else TEXT))
-            row.bind("<Button-1>", lambda e, v=value: self._choose(v))
-        try:
-            self.update_idletasks()
-            x = self.winfo_rootx()
-            y = self.winfo_rooty() + self.winfo_height() + 4
-            alto = min(len(self._values), 12) * 34 + 2
-            try:
-                if y + alto > self.winfo_screenheight() - 16:
-                    y = max(8, self.winfo_rooty() - alto - 4)
-                x = max(8, min(x, self.winfo_screenwidth() - self.winfo_width() - 8))
-            except Exception:
-                pass
-            top.geometry(f"{self.winfo_width()}x{alto}+{x}+{y}")
-        except tk.TclError:
-            pass
-        self._popup = top
-        try:
-            top.grab_set()
-        except tk.TclError:
-            pass
-        try:
-            top.bind_all("<Button-1>", self._maybe_close, add="+")
-            top.bind_all("<Escape>", lambda e: self._close(), add="+")
-        except Exception:
-            pass
 
-    def _maybe_close(self, event):
-        try:
-            if self._popup is None:
-                return
-            x, y = event.x_root, event.y_root
-            px, py = self._popup.winfo_rootx(), self._popup.winfo_rooty()
-            pw, ph = self._popup.winfo_width(), self._popup.winfo_height()
-            if not (px <= x <= px + pw and py <= y <= py + ph):
-                self._close()
-        except Exception:
-            self._close()
+        self._popup = tk.Toplevel(self)
+        self._popup.wm_overrideredirect(True) 
+        self._popup.attributes("-topmost", True)
+        self._popup.configure(bg=BORDER_FIELD) 
+        
+        frame = tk.Frame(self._popup, bg=SURFACE, bd=1, relief="solid")
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+        for value in self._values:
+            selected = value == self.variable.get()
+            label = ("●  " if selected else "    ") + str(value)
+            
+            lbl = tk.Label(frame, text=label, bg=SURFACE, fg=TEXT, anchor="w",
+                           padx=10, pady=6, font=(F_SEMI, 10), cursor="hand2")
+            lbl.pack(fill="x")
+            
+            lbl.bind("<Enter>", lambda e, l=lbl: l.configure(bg=FIELD, fg=YEL))
+            lbl.bind("<Leave>", lambda e, l=lbl, v=selected: l.configure(bg=SURFACE, fg=YEL if v else TEXT))
+            lbl.bind("<Button-1>", lambda e, v=value: self._choose(v))
+
+        self.update_idletasks()
+        self._popup.update_idletasks()
+
+        w = max(self.winfo_width(), self._popup.winfo_reqwidth())
+        h = self._popup.winfo_reqheight()
+        
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        
+        if y + h > self.winfo_screenheight() - 8:
+            y = max(8, self.winfo_rooty() - h)
+
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+        
+        # Si el menú pierde el foco (ej. clic en otra app), se cierra
+        self._popup.bind("<FocusOut>", lambda e: self._close())
+        
+        # --- NUEVOS BINDS PARA EVITAR EL "BUGEo" ---
+        root = self.winfo_toplevel()
+        
+        # 1. Cerrar si se hace clic en otro lado de la app
+        self._root_click_id = root.bind("<Button-1>", self._global_click, add="+")
+        
+        # 2. Cerrar si la ventana principal se mueve o redimensiona
+        self._root_config_id = root.bind("<Configure>", self._close, add="+")
+        
+        # 3. Cerrar si se hace scroll en cualquier parte de la app. Se registra
+        # en el despachador global: así no se toca el binding de la rueda.
+        if self not in _WHEEL_CLOSERS:
+            _WHEEL_CLOSERS.append(self)
+        self._root_wheel_id = None
+        
+        # 4. Cerrar si la ventana principal se minimiza
+        self._root_unmap_id = root.bind("<Unmap>", self._close, add="+")
 
     def _choose(self, value):
         self._close()
@@ -868,7 +896,6 @@ class BrandSelect(tk.Canvas):
                 self.command()
             except Exception:
                 pass
-
 
 # ─────────────────────────────────────────────────────────────
 # PROGRESO
@@ -1015,18 +1042,74 @@ class PulseDot(tk.Canvas):
 # ─────────────────────────────────────────────────────────────
 # SCROLL
 # ─────────────────────────────────────────────────────────────
+_WHEEL_ROOTS = set()
+_WHEEL_CLOSERS = []
+
+
+def _ensure_wheel(root):
+    """Instala un único despachador de rueda por intérprete Tk.
+
+    Antes cada widget agregaba y quitaba su propio `bind_all("<MouseWheel>")`;
+    al cerrar un desplegable se hacía `unbind_all` y se borraban TODOS los
+    enlaces globales, incluido el del área de scroll: la rueda dejaba de
+    funcionar hasta reiniciar. Con un solo despachador eso no puede pasar.
+    """
+    key = str(root)
+    if key in _WHEEL_ROOTS:
+        return
+    try:
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            root.bind_all(seq, _wheel_dispatch, add="+")
+        _WHEEL_ROOTS.add(key)
+    except tk.TclError:
+        pass
+
+
+def _wheel_dispatch(event):
+    # 1) Cerrar menús desplegables abiertos.
+    for widget in list(_WHEEL_CLOSERS):
+        try:
+            widget._close()
+        except Exception:
+            pass
+    # 2) Desplazar el área que está debajo del puntero (la última creada gana).
+    for area in reversed(list(ScrollArea._AREAS)):
+        try:
+            if area._wheel(event) == "break":
+                return "break"
+        except Exception:
+            continue
+    return None
+
+
 class SlimScrollbar(tk.Canvas):
-    def __init__(self, master, command, width=9, bg=BG):
-        super().__init__(master, width=width, bg=bg, bd=0, highlightthickness=0)
+    """Barra vertical fina, estilo IndieDL.
+
+    Sólo aparece cuando hay contenido para desplazar. El riel se dibuja tenue y
+    la pastilla se engorda al pasar el puntero: da feedback sin mover nada de
+    lugar (el ancho de la barra queda reservado siempre).
+    """
+
+    def __init__(self, master, command, width=10, bg=BG):
+        super().__init__(master, width=width, height=1, bg=bg, bd=0,
+                         highlightthickness=0, takefocus=0)
         self.command = command
         self._first, self._last = 0.0, 1.0
         self._drag = None
-        self._thumb = None
+        self._hover = False
         self._size = (0, 0)
         self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+
+    def _set_hover(self, on):
+        if on == self._hover:
+            return
+        self._hover = on
+        self._draw()
 
     def _on_configure(self, event):
         size = (event.width, event.height)
@@ -1046,9 +1129,9 @@ class SlimScrollbar(tk.Canvas):
         h = self.winfo_height()
         top = self._first * h
         bottom = self._last * h
-        if bottom - top < 32:
-            bottom = min(h, top + 32)
-            top = max(0, bottom - 32)
+        if bottom - top < 36:
+            bottom = min(h, top + 36)
+            top = max(0, bottom - 36)
         return h, top, bottom
 
     def _draw(self):
@@ -1061,12 +1144,16 @@ class SlimScrollbar(tk.Canvas):
             return
         if (self._last - self._first) >= 0.999:
             return  # todo el contenido visible: no ocupamos lugar visual
-        round_rect_item(self, w / 2 - 1.5, 2, w / 2 + 1.5, h - 2, 1.5,
-                        fill="#1B232B", outline="")
+        cx = w / 2
+        round_rect_item(self, cx - 1, 2, cx + 1, h - 2, 1,
+                        fill="#1A222A", outline="")
         _, top, bottom = self._geometry()
-        round_rect_item(self, 1, top, w - 1, bottom, (w - 2) / 2,
-                        fill="#46525E", outline="")
+        thumb_w = 6 if self._hover else 4
+        round_rect_item(self, cx - thumb_w / 2, top, cx + thumb_w / 2, bottom,
+                        thumb_w / 2,
+                        fill="#5C6A77" if self._hover else "#46525E", outline="")
 
+    # ---- arrastre ----
     def _press(self, event):
         h, top, bottom = self._geometry()
         if top <= event.y <= bottom:
@@ -1080,7 +1167,8 @@ class SlimScrollbar(tk.Canvas):
         if self._drag is None:
             return
         try:
-            self.command("moveto", max(0.0, min(1.0, (event.y - self._drag) / max(1, self.winfo_height()))))
+            self.command("moveto", max(0.0, min(
+                1.0, (event.y - self._drag) / max(1, self.winfo_height()))))
         except Exception:
             pass
 
@@ -1092,12 +1180,25 @@ class SlimScrollbar(tk.Canvas):
 
 
 class ScrollArea(tk.Frame):
+    """Área de scroll propia, con rueda suave y siempre activa.
+
+    Tk mueve un `Canvas` de golpe: un diente de rueda salta 120 px y se siente
+    tosco. Acá el desplazamiento se anima con la misma curva corta que usa
+    IndieDL (cubic ease-out, 120-190 ms) y el manejador de rueda busca el área
+    que está debajo del puntero, así funciona también sobre tarjetas, canvas y
+    etiquetas anidadas. Los `Text`/`Listbox` conservan su scroll nativo.
+    """
+
+    _AREAS = []
+
     def __init__(self, master, bg=BG, pad=22):
         super().__init__(master, bg=bg, bd=0, highlightthickness=0)
-        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0,
+                                takefocus=0)
         self.inner = tk.Frame(self.canvas, bg=bg)
-        self._win = self.canvas.create_window(pad, 18, window=self.inner, anchor="nw")
-        self.bar = SlimScrollbar(self, command=self.canvas.yview, bg=bg)
+        self._win = self.canvas.create_window(pad, 18, window=self.inner,
+                                              anchor="nw")
+        self.bar = SlimScrollbar(self, command=self._scrollbar_command, bg=bg)
         self.canvas.configure(yscrollcommand=self._on_scroll)
         self.canvas.pack(side="left", fill="both", expand=True)
         # La barra ocupa siempre el mismo ancho: si aparece/desaparece, el
@@ -1105,10 +1206,21 @@ class ScrollArea(tk.Frame):
         self.bar.pack(side="right", fill="y", padx=(0, 4))
         self.inner.bind("<Configure>", self._on_inner)
         self.canvas.bind("<Configure>", self._on_canvas)
-        self._wheel_px = 0.0
-        self._wheel_job = None
-        self.bind_all("<MouseWheel>", self._wheel, add="+")
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
+        self._content_h = 0
+        self._visible_frac = 1.0
+        self._anim_job = None
+        self._anim_start = 0.0
+        self._anim_target = 0.0
+        self._anim_t0 = 0.0
+        self._anim_dur = 0.18
+        self._animating = False
+
+        ScrollArea._AREAS.append(self)
+        _ensure_wheel(self.winfo_toplevel())
+
+    # ---- geometría ----
     def _on_inner(self, event=None):
         if event is not None:
             size = (event.width, event.height)
@@ -1119,6 +1231,8 @@ class ScrollArea(tk.Frame):
         self._inner_size = size
         try:
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            region = self.canvas.bbox("all")
+            self._content_h = max(1, region[3] - region[1]) if region else 1
         except tk.TclError:
             pass
 
@@ -1134,43 +1248,144 @@ class ScrollArea(tk.Frame):
         self._on_inner()
 
     def _on_scroll(self, first, last):
+        try:
+            first, last = float(first), float(last)
+        except Exception:
+            first, last = 0.0, 1.0
         self.bar.set(first, last)
+        self._visible_frac = max(0.0, last - first)
+        if self._animating or self._anim_job is not None:
+            # El movimiento lo produce la animación: no reescribir el destino
+            # con la posición intermedia (realimentación que frena el scroll).
+            return
+        self._anim_start = self._anim_target = first
 
+    def _scrollbar_command(self, *args):
+        self._cancel_anim()
+        try:
+            self.canvas.yview(*args)
+        except tk.TclError:
+            return
+        pos = float(self.canvas.yview()[0])
+        self._anim_start = self._anim_target = pos
+
+    # ---- rueda ----
     def _wheel(self, event):
         try:
             x, y = self.winfo_pointerxy()
-            under = self.winfo_containing(x, y)
+            if not self.winfo_ismapped():
+                return None
+            if not (self.winfo_rootx() <= x < self.winfo_rootx() + self.winfo_width()
+                    and self.winfo_rooty() <= y < self.winfo_rooty() + self.winfo_height()):
+                return None
+            widget = self.winfo_containing(x, y)
+            if widget is not None and widget.winfo_class() in (
+                    "Text", "Listbox", "TCombobox", "Spinbox", "TSpinbox"):
+                return None  # ese widget conserva su scroll nativo
         except Exception:
-            return
-        if under is None:
-            return
-        if not (under is self or str(under).startswith(str(self))):
-            return
-        self._wheel_px += float(-event.delta)
-        if self._wheel_job is None:
-            self._wheel_job = self.after(12, self._apply_wheel)
+            return None
+        if getattr(event, "num", None) in (4, 5):
+            px = -60.0 if event.num == 4 else 60.0
+        else:
+            delta = float(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return None
+            px = -delta * 0.50
+        self.scroll_pixels(px)
         return "break"
 
-    def _apply_wheel(self):
-        self._wheel_job = None
-        px, self._wheel_px = self._wheel_px, 0.0
-        if not px:
+    # ---- animación ----
+    def _cancel_anim(self):
+        if self._anim_job is not None:
+            try:
+                self.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+        self._animating = False
+
+    def scroll_pixels(self, px):
+        if not self.winfo_ismapped():
             return
+        height = self.canvas.winfo_height()
+        if self._content_h <= height + 2:
+            return
+        now = time.perf_counter()
+        current = float(self.canvas.yview()[0])
+        if self._anim_job is None or now > self._anim_t0 + self._anim_dur + 0.05:
+            self._anim_target = current
+        frac = float(px) / max(1.0, float(self._content_h))
+        self._anim_target = max(0.0, min(1.0, self._anim_target + frac))
+        self._anim_start = current
+        self._anim_t0 = now
+        self._anim_dur = 0.12 if abs(px) < 40 else 0.19
+        if self._anim_job is None:
+            self._anim_job = self.after(8, self._anim_tick)
+
+    def to_top(self):
+        self._cancel_anim()
         try:
-            region = self.canvas.bbox("all")
-            alto = (region[3] - region[1]) if region else 1
-            actual = self.canvas.yview()[0]
-            destino = max(0.0, min(1.0, actual + px / max(1.0, float(alto))))
-            self.canvas.yview_moveto(destino)
-            # Mover las ventanas embebidas antes del siguiente evento:
-            # sin esto, Tk acumula eventos y se ve el "desgarro".
-            self.canvas.update_idletasks()
+            self.canvas.yview_moveto(0.0)
+            self._anim_start = self._anim_target = 0.0
         except tk.TclError:
             pass
 
+    def scroll_to(self, px):
+        """Lleva el contenido a una posición absoluta (px) con la misma curva."""
+        if not self.winfo_ismapped():
+            return
+        frac = max(0.0, min(1.0, float(px) / max(1.0, float(self._content_h))))
+        self._cancel_anim()
+        self._anim_start = float(self.canvas.yview()[0])
+        self._anim_target = frac
+        self._anim_t0 = time.perf_counter()
+        self._anim_dur = 0.22
+        self._anim_job = self.after(8, self._anim_tick)
+
     def to_bottom(self):
+        if not self.winfo_ismapped():
+            return
+        self._cancel_anim()
+        self._anim_start = float(self.canvas.yview()[0])
+        self._anim_target = 1.0
+        self._anim_t0 = time.perf_counter()
+        self._anim_dur = 0.22
+        self._anim_job = self.after(8, self._anim_tick)
+
+    def at_bottom(self, tolerance=0.02):
         try:
-            self.canvas.yview_moveto(1.0)
-            self.canvas.update_idletasks()
+            return float(self.canvas.yview()[1]) >= 1.0 - tolerance
         except tk.TclError:
+            return True
+
+    def _anim_tick(self):
+        self._anim_job = None
+        try:
+            elapsed = time.perf_counter() - self._anim_t0
+            p = 1.0 if self._anim_dur <= 0 else min(1.0, elapsed / self._anim_dur)
+            eased = 1.0 - (1.0 - p) ** 3  # cubic ease-out
+            pos = self._anim_start + (self._anim_target - self._anim_start) * eased
+            self._animating = True
+            try:
+                self.canvas.yview_moveto(max(0.0, min(1.0, pos)))
+            finally:
+                self._animating = False
+            if p < 1.0:
+                self._anim_job = self.after(8, self._anim_tick)
+            else:
+                # Si el lienzo recortó el destino, se sincroniza para que el
+                # próximo gesto arranque desde donde realmente quedó.
+                real = float(self.canvas.yview()[0])
+                self._anim_start = self._anim_target = real
+        except tk.TclError:
+            self._animating = False
+            self._anim_job = None
+
+    def _on_destroy(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        self._cancel_anim()
+        try:
+            ScrollArea._AREAS.remove(self)
+        except ValueError:
             pass

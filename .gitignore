@@ -1,17 +1,29 @@
-# Entorno local y archivos regenerables
-.venv/
+# ── Datos de ejecución (nunca subir) ──────────────────────────
+subtitulos_config.json
+subtitulos.log
+lanzador.log
+*.log
+
+# ── Python ────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.log
-*.tmp
-cuda-runtime/
-models/
-*.srt
-*.wav
-*.pkl
-traducciones_cache.json
-app/subtitulos_config.json
-outputs/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Compilados ────────────────────────────────────────────────
 build/
 dist/
-*.spec
+dist_anterior/
+_archive/
+*.exe
+
+# ── Copias de seguridad locales ───────────────────────────────
+*.bak
+*.pre-*
+
+# ── Sistema ───────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
