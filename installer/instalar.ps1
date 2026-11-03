@@ -8,7 +8,7 @@
       2. Entorno virtual compartido + dependencias (faster-whisper, ctranslate2, av...)
       3. FFmpeg (obligatorio para esta herramienta)
       4. Copia la app a %LOCALAPPDATA%\IndieDL\subs
-      5. Acceso directo y lanzador dentro del menu Scripts de DaVinci Resolve
+      5. Acceso directo y lanzador dentro del menu Scripts -> Edit de DaVinci Resolve
       6. Verificacion final (Resolve, FFmpeg, Whisper)
 
     Uso:
@@ -36,7 +36,7 @@ $ReqFile = Join-Path $RepoDir 'requirements.txt'
 $ResolveApi = Join-Path $env:PROGRAMDATA 'Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting'
 $ResolveModules = Join-Path $ResolveApi 'Modules'
 $ResolveExe = Join-Path $env:ProgramFiles 'Blackmagic Design\DaVinci Resolve\Resolve.exe'
-$ResolveScripts = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
+$ResolveScripts = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Edit'
 
 function Titulo {
     Write-Host ''
@@ -194,7 +194,8 @@ Bien 'faster-whisper, ctranslate2, av, tokenizers, numpy, Pillow, python-docx'
 Paso '5/6  Archivos de la aplicacion'
 $archivos = @(
     'subtitulos.py', 'subtitulos_ui.py', 'indie_ui.py', 'mezcla_audio.py',
-    'gpu_runtime.py', 'verificacion.py', 'verificar.py', 'cortes.py'
+    'gpu_runtime.py', 'verificacion.py', 'verificar.py', 'cortes.py',
+    'SubsSaul.py'
 )
 foreach ($f in $archivos) {
     $origen = Join-Path $RepoDir ('app\' + $f)
@@ -232,15 +233,15 @@ if ($resolveOk) {
 if (-not $SinResolve) {
     if (Test-Path $ResolveScripts) {
         try {
-            Copy-Item (Join-Path $RepoDir 'installer\Indie Now - Subtitulos.py') $ResolveScripts -Force
-            Bien 'Lanzador agregado al menu Scripts -> Utility de Resolve'
-            Detalle 'Reinicia Resolve para que aparezca: Workspace -> Scripts -> Utility'
+            Copy-Item (Join-Path $RepoDir 'app\SubsSaul.py') $ResolveScripts -Force
+            Bien 'Lanzador agregado al menu Scripts -> Edit de Resolve'
+            Detalle 'Reinicia Resolve para que aparezca: Fusion -> Scripts -> Edit -> SubsSaul'
         } catch {
             Aviso "No se pudo copiar el lanzador a la carpeta de scripts de Resolve: $($_.Exception.Message)"
         }
     } else {
         Aviso 'Todavia no existe la carpeta de scripts de Resolve (?nunca abriste Resolve en este usuario?).'
-        Detalle "Despues de abrirlo una vez, copia 'Indie Now - Subtitulos.py' a:"
+        Detalle 'Despues de abrirlo una vez, copia app\SubsSaul.py como SubsSaul.py a:'
         Detalle $ResolveScripts
     }
 }
@@ -263,7 +264,7 @@ Write-Host '  =========================================================' -Foregr
 Write-Host '   LISTO' -ForegroundColor Green
 Write-Host ''
 Write-Host '   Como usarla:' -ForegroundColor White
-Write-Host '     - Desde Resolve:  Workspace -> Scripts -> Utility -> Indie Now - Subtitulos' -ForegroundColor Gray
+Write-Host '     - Desde Resolve:  Fusion -> Scripts -> Edit -> SubsSaul' -ForegroundColor Gray
 Write-Host '     - O con el acceso directo "Indie Now Subtitulos"' -ForegroundColor Gray
 Write-Host ''
 Write-Host '   Necesita Resolve abierto, con un proyecto y una timeline.' -ForegroundColor Gray

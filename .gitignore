@@ -1,5 +1,8 @@
 # ── Datos de ejecución (nunca subir) ──────────────────────────
 subtitulos_config.json
+*_config.json
+traducciones_cache.json
+*_cache.json
 subtitulos.log
 lanzador.log
 *.log

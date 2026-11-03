@@ -9,6 +9,7 @@ import re
 import sys
 import json
 import math
+import stat
 import unicodedata
 import subprocess
 import tempfile
@@ -57,6 +58,13 @@ SOLO = "(SRT como pista de subtítulos)"
 NOMBRES_IDIOMA = {
     "es": "español", "en": "inglés", "pt": "portugués",
     "fr": "francés", "it": "italiano", "de": "alemán",
+    "ja": "japonés", "ko": "coreano", "zh": "chino",
+    "ru": "ruso", "ar": "árabe", "hi": "hindi",
+    "tr": "turco", "id": "indonesio", "nl": "neerlandés",
+    "pl": "polaco", "sv": "sueco", "uk": "ucraniano",
+    "vi": "vietnamita", "th": "tailandés", "he": "hebreo",
+    "el": "griego", "cs": "checo", "ro": "rumano",
+    "hu": "húngaro", "da": "danés", "fi": "finés", "no": "noruego",
 }
 IDIOMAS_VALIDOS = ("auto",) + tuple(NOMBRES_IDIOMA)
 ESTILOS_TRAD = ("palabras", "frases")
@@ -353,47 +361,168 @@ def cargar_wav(path):
     except Exception:
         return np.zeros(16000, dtype=np.float32)
 
-def segmentos_audio(pistas, f_ini, f_fin, tmp):
+def _factor_velocidad_item(item):
+    """Devuelve (factor positivo, reversa, disponible) del retime del clip."""
+    dato = None
+    try:
+        dato = item.GetSpeed()
+    except Exception:
+        pass
+    reversa = False
+    valor = None
+    if isinstance(dato, dict):
+        valor = dato.get("Percentage", dato.get("Speed", dato.get("speed")))
+        reversa = bool(dato.get("Reverse", dato.get("reverse", False)))
+    else:
+        valor = dato
+    try:
+        if isinstance(valor, str):
+            texto = valor.strip().replace("%", "")
+            valor = float(texto)
+            porcentaje = "%" in str(dato)
+        else:
+            valor = float(valor)
+            porcentaje = isinstance(dato, dict) or abs(valor) > 10.0
+        if porcentaje:
+            valor /= 100.0
+        if valor < 0:
+            reversa = True
+            valor = abs(valor)
+        if not math.isfinite(valor) or valor <= 0:
+            raise ValueError("velocidad de retime no positiva")
+        return valor, reversa, True
+    except (TypeError, ValueError):
+        return 1.0, reversa, False
+
+
+def _mapear_intervalo_audio(item, a, b, fps):
+    """Mapea un intervalo de timeline a tiempo fuente, contemplando retime.
+
+    `GetSourceStartTime/EndTime` están en segundos de la fuente; `GetSpeed`
+    devuelve el porcentaje de reproducción de Resolve. Si el API no expone los
+    tiempos fuente, se conserva el cálculo compatible con clips a 1x.
+    """
+    fps = float(fps)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("FPS de timeline inválidos")
+    clip_start = float(item.GetStart())
+    clip_end = float(item.GetEnd())
+    timeline_delta = max(0.0, (float(a) - clip_start) / fps)
+    timeline_duration = max(0.0, (float(b) - float(a)) / fps)
+    if timeline_duration <= 0:
+        raise ValueError("intervalo de audio vacío")
+
+    speed, reverse, speed_api = _factor_velocidad_item(item)
+    try:
+        source_start = float(item.GetSourceStartTime())
+    except Exception:
+        source_start = float(item.GetLeftOffset()) / fps
+    try:
+        source_end = float(item.GetSourceEndTime())
+        if source_end < source_start:
+            reverse = True
+    except Exception:
+        source_end = None
+
+    # Si una versión del API no expone GetSpeed, se infiere el factor medio
+    # del tramo fuente. Si GetSpeed sí lo proporciona, ese valor es autoridad.
+    clip_duration = max(0.0, (clip_end - clip_start) / fps)
+    if not speed_api and source_end is not None and clip_duration > 0:
+        span_speed = abs(source_end - source_start) / clip_duration
+        if math.isfinite(span_speed) and span_speed > 0:
+            speed = span_speed
+
+    if reverse:
+        source_seek = source_start - (timeline_delta + timeline_duration) * speed
+    else:
+        source_seek = source_start + timeline_delta * speed
+    source_duration = timeline_duration * speed
+    if source_seek < 0:
+        # En retimes inversos/handles raros, no inventar un offset negativo.
+        raise ValueError(f"retime apunta antes del inicio de la fuente ({source_seek:.3f}s)")
+    return source_seek, source_duration, timeline_duration, speed, reverse
+
+
+def _filtro_tempo_retime(speed, reverse=False):
+    """FFmpeg tempo para que el tramo fuente dure lo mismo que en la timeline."""
+    tempo = float(speed)
+    if not math.isfinite(tempo) or tempo <= 0:
+        raise ValueError("factor de tempo inválido")
+    filtros = ["areverse"] if reverse else []
+    while tempo < 0.5:
+        filtros.append("atempo=0.5")
+        tempo /= 0.5
+    while tempo > 2.0:
+        filtros.append("atempo=2.0")
+        tempo /= 2.0
+    if abs(tempo - 1.0) > 1e-7:
+        filtros.append(f"atempo={tempo:.9f}")
+    return ",".join(filtros)
+
+
+def segmentos_audio(pistas, f_ini, f_fin, tmp, progreso=None):
+    """Extrae audio en tiempo de timeline, incluyendo el retime de cada clip."""
     por_pista = []
+    trabajos = []
     for pista in pistas:
-        segmentos = []
         try:
             items = timeline.GetItemListInTrack("audio", pista) or []
         except Exception:
             items = []
-            
-        for i, it in enumerate(items):
-            a = max(it.GetStart(), f_ini)
-            b = min(it.GetEnd(), f_fin)
-            if b <= a:
-                continue
-                
+        for i, item in enumerate(items):
             try:
-                mpi = it.GetMediaPoolItem()
-                if not mpi: continue
-                src = mpi.GetClipProperty("File Path")
-                if not src or not os.path.exists(src): continue
-                
-                # Fórmula exacta de cortes.py
-                off = (it.GetLeftOffset() + (a - it.GetStart())) / FPS
-                dur = (b - a) / FPS
-                wav = os.path.join(tmp, f"p{pista}_seg{i}.wav")
-                
-                cmd = [
-                    "ffmpeg", "-y", "-loglevel", "error", 
-                    "-ss", f"{off:.3f}", "-t", f"{dur:.3f}",
-                    "-i", src, "-ac", "1", "-ar", "16000", wav
-                ]
-                ejecutar_proceso(cmd, capture_output=True)
-                
-                if os.path.exists(wav) and os.path.getsize(wav) > 44:
-                    segmentos.append((wav, (a - f_ini) / FPS))
-            except Exception as e:
-                _log(f"Error procesando item de audio (pista {pista}, clip {i}): {e}")
+                a = max(float(item.GetStart()), float(f_ini))
+                b = min(float(item.GetEnd()), float(f_fin))
+            except Exception:
                 continue
-                
-        por_pista.append((pista, segmentos))
-        
+            if b > a:
+                trabajos.append((pista, i, item, a, b))
+
+    total = len(trabajos)
+    segmentos_por_pista = {int(p): [] for p in pistas}
+    cada = max(1, total // 20)
+    for indice, (pista, i, item, a, b) in enumerate(trabajos):
+        if progreso and (indice % cada == 0 or indice == total - 1):
+            pct = 5 + 15 * indice / max(1, total)
+            progreso(pct, f"Extrayendo audio A{pista}, clip {indice + 1}/{total}…")
+        try:
+            mpi = item.GetMediaPoolItem()
+            if not mpi:
+                continue
+            src = mpi.GetClipProperty("File Path")
+            if not src or not os.path.exists(src):
+                continue
+
+            source_seek, source_duration, timeline_duration, speed, reverse = _mapear_intervalo_audio(
+                item, a, b, FPS
+            )
+            wav = os.path.join(tmp, f"p{pista}_seg{i}.wav")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{source_seek:.6f}", "-t", f"{source_duration:.6f}",
+                "-i", src,
+            ]
+            filtro = _filtro_tempo_retime(speed, reverse)
+            if filtro:
+                cmd.extend(["-af", filtro])
+            # El límite de salida garantiza que el WAV representa exactamente
+            # la duración de timeline, aunque FFmpeg redondee muestras/frames.
+            cmd.extend(["-t", f"{timeline_duration:.6f}", "-ac", "1", "-ar", "16000", wav])
+            if abs(speed - 1.0) > 0.005:
+                _log(f"[retime audio] A{pista} clip {i}: {speed * 100:.2f}% "
+                     f"fuente {source_seek:.3f}s + {source_duration:.3f}s "
+                     f"→ timeline {timeline_duration:.3f}s" + (" (reverse)" if reverse else ""))
+            ejecutar_proceso(cmd, capture_output=True)
+
+            if os.path.exists(wav) and os.path.getsize(wav) > 44:
+                segmentos_por_pista[int(pista)].append((wav, (a - f_ini) / FPS))
+        except Exception as exc:
+            _log(f"Error procesando audio A{pista}, clip {i}: {type(exc).__name__}: {exc}")
+            continue
+
+    if progreso and total:
+        progreso(20, f"Audio extraído y alineado ({total} segmentos revisados).")
+    por_pista = [(int(p), segmentos_por_pista[int(p)]) for p in pistas]
     duracion_total = (f_fin - f_ini) / FPS
     return mezcla_audio.mezclar(por_pista, duracion_total, tmp)
 
@@ -494,9 +623,8 @@ def construir_audio(segs):
     return np.clip(mix, -1.0, 1.0)
 
 
-def recuperar_huecos(palabras, segs, modelo, language, glosario="", min_hueco=0.25, min_voz=0.20):
-    """Busca tramos con voz donde no quedó ninguna palabra y los vuelve a transcribir
-    (sin guion en el prompt). Lo que dice el audio manda."""
+def recuperar_huecos(palabras, segs, modelo, language, glosario="", min_hueco=0.25, min_voz=0.20, velocidad=1.0):
+    """Busca tramos con voz y reescala timestamps si el audio estaba acelerado."""
     try:
         r = construir_envolvente(segs)
         audio = construir_audio(segs)
@@ -533,6 +661,11 @@ def recuperar_huecos(palabras, segs, modelo, language, glosario="", min_hueco=0.
             trozo = audio[int(w0 * 16000):int(w1 * 16000)]
             if len(trozo) < 3200: continue
             try:
+                factor_t = 1.0
+                if velocidad > 1.005:
+                    # La recuperación usa el audio original; se convierte a
+                    # un factor temporal coherente con la pasada acelerada.
+                    factor_t = 1.0 / float(velocidad)
                 kw = dict(language=language, word_timestamps=True, vad_filter=False, beam_size=5,
                           condition_on_previous_text=False, initial_prompt=glosario or None)
                 it, _ = modelo.transcribe(trozo, **kw)
@@ -540,7 +673,9 @@ def recuperar_huecos(palabras, segs, modelo, language, glosario="", min_hueco=0.
                     if any(x in norm(seg.text) for x in ALUCINACIONES): continue
                     if seg.no_speech_prob > 0.6: continue
                     for pw in seg.words or []:
-                        ws, we = w0 + pw.start, w0 + pw.end
+                        ws = w0 + pw.start * factor_t
+                        we = w0 + pw.end * factor_t
+                        if we < ws: ws, we = we, ws
                         centro = (ws + we) / 2
                         txt = pw.word.strip()
                         if not norm(txt) or not (g0 <= centro <= g1): continue
@@ -619,10 +754,61 @@ _ultimos = []
 _idioma_detectado = ""
 
 
+def _sin_habla(texto):
+    """Línea que no es habla: [Música], (risas), ♪ o solo signos.
+
+    Concat descarta estas líneas antes de armar los subtítulos: Whisper las
+    inventa sobre música y silencio y ensucian el SRT.
+    """
+    t = (texto or "").strip()
+    if not t:
+        return True
+    if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+        return True
+    return not any(c.isalnum() for c in t)
+
+
+# Concat: un tramo que se repite 3 veces o más y cubre 6 palabras o más es
+# un bucle de Whisper, no algo que se haya dicho. Se deja la última vuelta.
+_LOOP_UNIDAD = 8
+_LOOP_MINIMO = 6
+
+
+def quitar_loops(palabras):
+    """Quita frases que Whisper repite en bucle dentro de una misma línea."""
+    if not palabras:
+        return palabras
+    planos = [norm(p[0]) for p in palabras]
+    total = len(palabras)
+    salida, i = [], 0
+    while i < total:
+        mejor = None
+        for unidad in range(1, min(_LOOP_UNIDAD, total - i) + 1):
+            veces = 1
+            while i + (veces + 1) * unidad <= total and all(
+                    planos[i + k] == planos[i + veces * unidad + k]
+                    for k in range(unidad)):
+                veces += 1
+            cubre = veces * unidad
+            if veces >= 3 and cubre >= _LOOP_MINIMO and (
+                    mejor is None or cubre > mejor[0] * mejor[1]):
+                mejor = (unidad, veces)
+        if mejor:
+            unidad, veces = mejor
+            ultimo = i + (veces - 1) * unidad
+            salida.extend(palabras[ultimo:ultimo + unidad])
+            i += veces * unidad
+        else:
+            salida.append(palabras[i])
+            i += 1
+    return salida
+
+
 def es_alucinacion(seg, estricto=True):
     t = norm(seg.text)
     _ultimos.append(t)
     del _ultimos[:-3]
+    if _sin_habla(seg.text): return True
     if any(b in t for b in ALUCINACIONES): return True
     if not estricto: return False
     if t == "gracias": return True
@@ -668,7 +854,13 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma=
     if language is None:
         try:
             mejor = max(segs, key=lambda sg: os.path.getsize(sg[0]))
-            det = model.detect_language(cargar_wav(mejor[0])[:16000 * 30])
+            # Concat: el idioma se escucha sobre varias ventanas de voz, no
+            # sobre los primeros segundos (que suelen ser música o intro).
+            muestra = cargar_wav(mejor[0])[:16000 * 90]
+            try:
+                det = model.detect_language(muestra, language_detection_segments=3)
+            except TypeError:
+                det = model.detect_language(muestra)
             if det and det[0]:
                 language = str(det[0]); _idioma_detectado = language
                 _log(f"Idioma fijado para todos los clips: {language}")
@@ -695,11 +887,15 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma=
                 progreso(p_ini + (p_fin - p_ini) * avance, f"Transcribiendo en {dispositivo_actual}…")
                 if es_alucinacion(segmento, estricto=not con_guion): continue
                 for palabra in segmento.words or []:
-                    palabras.append([palabra.word.strip(), t0 + palabra.start, t0 + palabra.end])
+                    inicio = t0 + palabra.start
+                    fin = t0 + palabra.end
+                    palabras.append([palabra.word.strip(), inicio, fin])
             hecho += info.duration
         progreso(p_fin, "Buscando palabras que faltan…")
-        try: palabras = recuperar_huecos(palabras, segs, modelo_actual, language, prompt or "")
+        try: palabras = recuperar_huecos(palabras, segs, modelo_actual, language, prompt or "", velocidad=1.0)
         except Exception as exc: _log(f"[recuperar] error: {type(exc).__name__}: {exc}")
+        try: palabras = quitar_loops(palabras)
+        except Exception as exc: _log(f"[loops] error: {type(exc).__name__}: {exc}")
         return palabras
 
     try:
@@ -717,7 +913,40 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma=
             raise RuntimeError(f"Falló la GPU y tampoco se pudo completar en CPU. Error CUDA: {type(exc).__name__}: {exc}. Error CPU: {type(exc_cpu).__name__}: {exc_cpu}") from exc_cpu
 
 
+def _factor_tempo_seguro(factor):
+    factor = float(factor)
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError("El factor de velocidad debe ser positivo")
+    tempo = 1.0 / factor
+    partes = []
+    while tempo < 0.5:
+        partes.append("atempo=0.5")
+        tempo /= 0.5
+    while tempo > 2.0:
+        partes.append("atempo=2.0")
+        tempo /= 2.0
+    partes.append(f"atempo={tempo:.9f}")
+    return ",".join(partes)
+
+
 def armar_bloques(palabras):
+    """Agrupa palabras y sanea timestamps tras reescalar audio acelerado."""
+    normalizadas = []
+    ultimo_fin = 0.0
+    for palabra in palabras:
+        if len(palabra) < 4:
+            continue
+        texto, inicio, fin, grupo = palabra[:4]
+        try:
+            inicio = max(0.0, float(inicio))
+            fin = max(inicio, float(fin))
+        except (TypeError, ValueError):
+            continue
+        inicio = max(inicio, ultimo_fin)
+        fin = max(fin, inicio)
+        normalizadas.append([texto, inicio, fin, grupo])
+        ultimo_fin = fin
+    palabras = normalizadas
     bl = []
     i = 0
     while i < len(palabras):
@@ -756,10 +985,136 @@ def tc(t):
     return (f"{ms // 3600000:02}:{ms // 60000 % 60:02}:{ms // 1000 % 60:02},{ms % 1000:03}")
 
 
+def _reemplazar_reintentando(origen, destino, timeout=2.5):
+    """os.replace() tolerando bloqueos transitorios de Windows.
+
+    Pasa cuando Google Drive, el antivirus, OnlyOffice o Resolve tienen el
+    archivo abierto un instante. Reintentamos unos segundos y, si sigue
+    bloqueado, devolvemos False para guardar con otro nombre.
+    """
+    demora = 0.08
+    fin = time.time() + timeout
+    while True:
+        try:
+            os.replace(origen, destino)
+            return True
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32) and not isinstance(exc, PermissionError):
+                return False
+            if time.time() >= fin:
+                return False
+            time.sleep(demora)
+            demora = min(demora * 1.6, 0.5)
+
+
+def _guardar_texto(path, contenido):
+    """Guarda texto de forma atómica y tolerante a archivos bloqueados.
+
+    Escribe en un temporal dentro de la misma carpeta y reemplaza el destino.
+    Si el destino está abierto por otro programa, guarda una copia con fecha
+    en vez de fallar con PermissionError.
+    """
+    path = os.path.abspath(path)
+    carpeta = os.path.dirname(path) or "."
+    os.makedirs(carpeta, exist_ok=True)
+
+    # Si el archivo quedó con atributo de solo lectura, lo destrabamos.
+    try:
+        if os.path.exists(path) and not (os.stat(path).st_mode & stat.S_IWRITE):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+    except OSError:
+        pass
+
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".indie-", suffix=".tmp", dir=carpeta)
+    except OSError as exc:
+        # Una carpeta elegida en un volumen externo o protegida por Windows
+        # puede permitir leer pero no crear temporales. Guardamos en Documentos
+        # para no perder el SRT y devolvemos la ruta real al usuario.
+        fallback = os.path.join(os.path.expanduser("~"), "Documents")
+        if os.path.isdir(fallback) and os.path.normcase(fallback) != os.path.normcase(carpeta):
+            return _guardar_texto(os.path.join(fallback, os.path.basename(path)), contenido)
+        raise RuntimeError(
+            f"No se pudo escribir en la carpeta '{carpeta}'. "
+            f"Revisá permisos o si la carpeta está sincronizada/bloqueada: {exc}"
+        ) from exc
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(contenido)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if _reemplazar_reintentando(tmp, path):
+            return path
+
+        # Si no se pudo reemplazar el destino, probamos Documentos antes de
+        # devolver un error: el archivo generado nunca debe perderse.
+        fallback = os.path.join(os.path.expanduser("~"), "Documents", os.path.basename(path))
+        if os.path.normcase(fallback) != os.path.normcase(path):
+            if _reemplazar_reintentando(tmp, fallback):
+                return fallback
+
+        # El destino sigue bloqueado: no perdemos el trabajo, guardamos copia.
+        base, ext = os.path.splitext(path)
+        sello = time.strftime("%Y%m%d-%H%M%S")
+        for intento in range(1, 100):
+            sufijo = f".{sello}" if intento == 1 else f".{sello}-{intento}"
+            alterno = f"{base}{sufijo}{ext}"
+            if os.path.exists(alterno):
+                continue
+            if _reemplazar_reintentando(tmp, alterno):
+                return alterno
+            break
+        raise RuntimeError(
+            f"No se pudo guardar '{os.path.basename(path)}' porque está abierto "
+            f"o bloqueado por otro programa (Resolve, OnlyOffice, Google Drive o "
+            f"el antivirus). Cerrá ese archivo y reintentá."
+        )
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _envolver_srt(texto, ancho=42):
+    """Parte el texto en dos líneas legibles, como Concat (42 caracteres).
+
+    Una línea de 80 caracteres en pantalla se sale del cuadro. Se corta en
+    un espacio cerca de la mitad; si hace falta, se envuelve por ancho.
+    """
+    texto = " ".join(str(texto or "").split())
+    if len(texto) <= ancho:
+        return texto
+    if len(texto) <= 2 * ancho + 1:
+        mitad = len(texto) / 2.0
+        mejor = None
+        for i, ch in enumerate(texto):
+            if ch == " " and (mejor is None or abs(i - mitad) < abs(mejor - mitad)):
+                mejor = i
+        if mejor is not None and 0 < mejor < len(texto) - 1:
+            return texto[:mejor].rstrip() + "\n" + texto[mejor + 1:].lstrip()
+    lineas, actual = [], ""
+    for palabra in texto.split():
+        if not actual:
+            actual = palabra
+        elif len(actual) + 1 + len(palabra) <= ancho:
+            actual += " " + palabra
+        else:
+            lineas.append(actual)
+            actual = palabra
+    if actual:
+        lineas.append(actual)
+    return "\n".join(lineas)
+
+
 def escribir_srt(bloques, path):
-    with open(path, "w", encoding="utf-8") as f:
-        for n, (t, s, e) in enumerate(bloques, 1):
-            f.write(f"{n}\n{tc(s)} --> {tc(e)}\n<b>{t}</b>\n\n")
+    partes = []
+    for n, (t, s, e) in enumerate(bloques, 1):
+        partes.append(f"{n}\n{tc(s)} --> {tc(e)}\n<b>{_envolver_srt(t)}</b>\n\n")
+    return _guardar_texto(path, "".join(partes))
 
 
 _FIN_FRASE = re.compile(r"[.!?…][\"'”’)\]]*$")
@@ -851,7 +1206,8 @@ def traducir_lineas(lineas, origen, destino, progreso=None):
     while i < total:
         lote = []
         caracteres = 0
-        while i < total and len(lote) < 12 and (caracteres < 1400 or not lote):
+        # Oraciones completas: menos viajes y más contexto por llamada.
+        while i < total and len(lote) < 16 and (caracteres < 3000 or not lote):
             item = pendientes[i]
             lote.append(item)
             caracteres += len(item[1]) + 1
@@ -859,7 +1215,7 @@ def traducir_lineas(lineas, origen, destino, progreso=None):
         resultado = _google_lote([t for _, t in lote], origen, destino)
         if len(resultado) != len(lote): raise RuntimeError("La traducción no devolvió la misma cantidad de líneas.")
         for (indice, texto), trad in zip(lote, resultado):
-            trad = (trad or "").strip() or texto
+            trad = re.sub(r"\s+", " ", (trad or "")).strip() or texto
             cache[f"{origen}>{destino}|{texto}"] = trad
             salida[indice] = trad
         hechos += len(lote)
@@ -913,31 +1269,132 @@ def _partir_palabras(texto, duracion):
     return [" ".join(palabras[i:i + tam]) for i in range(0, len(palabras), tam)]
 
 
-def bloques_traduccion(unidades, traducciones, estilo="palabras"):
+def _agrupar_oraciones(unidades, textos, max_chars=320, max_dur=12.0, max_gap=1.2):
+    """Une fragmentos de una misma oración para traducir con contexto.
+
+    Traducir "Me dijo que" / "no iba a venir" por separado destroza la
+    gramática: Google no sabe quién habla ni en qué tiempo. Concat no
+    traduce (transcribe en el idioma pedido), pero la lección es la misma:
+    el texto se procesa en oraciones completas y después se reparte en el
+    tiempo de cada fragmento.
+    """
+    grupos, cur_u, cur_t = [], [], []
+    ini = fin = None
+    for unidad, texto in zip(unidades, textos):
+        if not unidad:
+            continue
+        u_ini, u_fin = float(unidad[0][1]), float(unidad[-1][2])
+        if cur_u:
+            anterior = cur_t[-1].strip()
+            hueco = u_ini - fin
+            dura = u_fin - ini
+            if (_FIN_FRASE.search(anterior) or hueco >= max_gap
+                    or len(" ".join(cur_t)) >= max_chars or dura >= max_dur):
+                grupos.append((cur_u, " ".join(cur_t)))
+                cur_u, cur_t, ini = [], [], None
+        if not cur_u:
+            ini = u_ini
+        cur_u.append(unidad)
+        cur_t.append(texto)
+        fin = u_fin
+    if cur_u:
+        grupos.append((cur_u, " ".join(cur_t)))
+    return grupos
+
+
+def _repartir_texto(texto, n):
+    """Parte una traducción en n trozos en límites de palabra.
+
+    Los cortes se buscan cerca de la posición proporcional, así cada trozo
+    cae sobre el fragmento de audio que le corresponde sin partir palabras.
+    """
+    texto = " ".join(str(texto or "").split())
+    if n <= 1 or not texto:
+        return [texto] * max(1, n)
+    if len(texto) <= n:
+        return [texto] + [""] * (n - 1)
+    cortes, inicio = [], 0
+    for k in range(1, n):
+        objetivo = round(len(texto) * k / n)
+        ventana = max(2, len(texto) // (n * 2))
+        lo = max(inicio + 1, objetivo - ventana)
+        hi = min(len(texto) - 1, objetivo + ventana)
+        mejor = None
+        for j in range(lo, hi + 1):
+            if texto[j] in " ,;:":
+                if mejor is None or abs(j - objetivo) < abs(mejor - objetivo):
+                    mejor = j
+        if mejor is None:
+            mejor = texto.rfind(" ", inicio + 1, objetivo)
+            if mejor <= inicio:
+                mejor = texto.find(" ", objetivo)
+            if mejor <= inicio or mejor >= len(texto):
+                mejor = objetivo
+        cortes.append(mejor)
+        inicio = mejor + 1
+    partes, previo = [], 0
+    for c in cortes:
+        partes.append(texto[previo:c].strip(" ,;:"))
+        previo = c + 1
+    partes.append(texto[previo:].strip(" ,;:"))
+    return partes
+
+
+def ajustar_ritmo(bloques, cps=17.0, min_dur=0.6, max_dur=8.0):
+    """Da tiempo de lectura: un subtítulo largo no puede durar 0,3 s.
+
+    Igual que Concat, se calcula lo que lleva leerlo (17 caracteres por
+    segundo) y se estira hasta el inicio del siguiente subtítulo.
+    """
+    total = len(bloques)
+    for i, b in enumerate(bloques):
+        try:
+            dur = float(b[2]) - float(b[1])
+            necesario = min(max_dur, max(min_dur, len(str(b[0])) / cps))
+        except (TypeError, ValueError):
+            continue
+        if dur >= necesario:
+            continue
+        limite = (float(bloques[i + 1][1]) - 0.04) if i + 1 < total else float(b[1]) + necesario
+        b[2] = max(float(b[2]), min(limite, float(b[1]) + necesario))
+    return bloques
+
+
+def bloques_traduccion(grupos, traducciones, estilo="palabras"):
+    """Reparte cada oración traducida sobre el audio de sus fragmentos."""
     bloques = []
-    for unidad, texto in zip(unidades, traducciones):
+    for unidades, texto in zip(grupos, traducciones):
         texto = (texto or "").strip()
-        if not texto or not unidad: continue
-        inicio = float(unidad[0][1])
-        final = float(unidad[-1][2])
-        if final <= inicio: final = inicio + 0.4
-        dur = max(0.3, final - inicio)
-        partes = (_partir_palabras(texto, dur) if estilo == "palabras" else _partir_frases(texto))
-        if not partes: continue
-        pesos = [max(1, len(p)) for p in partes]
-        total = sum(pesos)
-        t = inicio
-        for k, parte in enumerate(partes):
-            if k == len(partes) - 1: fin = final
-            else: fin = min(final, t + dur * pesos[k] / total)
-            if fin <= t: fin = t + 0.15
-            bloques.append([parte, t, fin])
-            t = fin
+        if not texto or not unidades:
+            continue
+        partes = _repartir_texto(texto, len(unidades))
+        for unidad, parte in zip(unidades, partes):
+            parte = (parte or "").strip(" ,;:-")
+            if not parte:
+                continue
+            inicio = float(unidad[0][1])
+            final = float(unidad[-1][2])
+            if final <= inicio: final = inicio + 0.4
+            dur = max(0.3, final - inicio)
+            trozos = (_partir_palabras(parte, dur) if estilo == "palabras"
+                      else _partir_frases(parte))
+            if not trozos:
+                continue
+            pesos = [max(1, len(p)) for p in trozos]
+            total = sum(pesos)
+            t = inicio
+            for k, trozo in enumerate(trozos):
+                if k == len(trozos) - 1: fin = final
+                else: fin = min(final, t + dur * pesos[k] / total)
+                if fin <= t: fin = t + 0.15
+                bloques.append([trozo, t, fin])
+                t = fin
     for k in range(len(bloques) - 1):
-        if bloques[k][2] > bloques[k + 1][1]: bloques[k][2] = bloques[k + 1][1]
+        if bloques[k][2] > bloques[k + 1][1]:
+            bloques[k][2] = max(bloques[k][1] + 0.1, bloques[k + 1][1])
     for b in bloques:
         if b[2] <= b[1]: b[2] = b[1] + 0.15
-    return bloques
+    return ajustar_ritmo(bloques)
 
 
 def _respaldar(ruta):
@@ -957,7 +1414,8 @@ def _respaldar(ruta):
         while os.path.exists(bak):
             n += 1
             bak = f"{base}.{sello}-{n}{ext}.bak"
-        os.replace(ruta, bak)
+        if not _reemplazar_reintentando(ruta, bak, timeout=0.5):
+            raise OSError("archivo bloqueado")
     except Exception: pass
 
 
@@ -1115,64 +1573,103 @@ def _textplus_de_item(item):
 def _borrar_items(items):
     items = [i for i in (items or []) if i is not None]
     if not items:
-        return
-    try: timeline.DeleteClips(items)
-    except Exception: pass
+        return True
+    try:
+        timeline.DeleteClips(items)
+        return True
+    except Exception as exc:
+        _log(f"[plantilla] no pude retirar clips parciales: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _limpiar_pista_insercion(pista):
+    """Retira sólo la pista nueva que creó aplicar_plantilla, si quedó vacía."""
+    try:
+        actuales = timeline.GetItemListInTrack("video", pista) or []
+        if actuales:
+            _borrar_items(actuales)
+        restantes = timeline.GetItemListInTrack("video", pista) or []
+        if not restantes and timeline.GetTrackCount("video") == pista:
+            return bool(timeline.DeleteTrack("video", pista))
+        return not restantes
+    except Exception as exc:
+        _log(f"[plantilla] no pude limpiar pista parcial {pista}: {type(exc).__name__}: {exc}")
+        return False
 
 
 def aplicar_plantilla(tpl, bloques, f_ini, progreso, p_ini=92, p_fin=100):
-    """Inserta los títulos en tandas cortas, no de una sola vez.
-
-    Con cientos de subtítulos, una única llamada a AppendToTimeline deja a
-    Resolve y a la ventana congelados varios segundos (y además cada título
-    hay que abrirlo para escribirle el Text+). En tandas de ~4 el trabajo se
-    reparte, la barra avanza y la interfaz sigue respondiendo.
-
-    La primera tanda es de UN título: si la plantilla no tiene nodo Text+ se
-    avisa al instante, sin haber llenado la línea de clips inservibles.
+    """Inserta títulos en lotes, informa antes de cada llamada a Resolve y
+    revierte la pista nueva si un lote falla o se cancela.
     """
     if not bloques:
         return True
     fps = FPS or 24.0
-    timeline.AddTrack("video")
-    pista = timeline.GetTrackCount("video")
     total = len(bloques)
+    num_lotes = 1 + max(0, math.ceil((total - 1) / _LOTE_INSERCION))
+    progreso(p_ini, "Creando la pista de subtítulos en Resolve…")
+    inicio_track = time.monotonic()
+    try:
+        timeline.AddTrack("video")
+    except Exception as exc:
+        raise RuntimeError(f"Resolve no pudo crear una pista de subtítulos: {exc}") from exc
+    pista = timeline.GetTrackCount("video")
+    _log(f"[plantilla] pista {pista} creada; {total} títulos en {num_lotes} lotes")
+
     insertados = []
     hechos = 0
     primera = True
+    lote = 0
 
     while hechos < total:
         if _cancelar_procesos.is_set():
-            _borrar_items(insertados)
-            raise RuntimeError("Proceso cancelado.")
+            limpiada = _limpiar_pista_insercion(pista)
+            estado = "La pista temporal se retiró." if limpiada else "Revisá la pista: Resolve no pudo retirar todos los clips parciales."
+            raise RuntimeError(f"Proceso cancelado durante la inserción. {estado}")
+
+        lote += 1
         tam = 1 if primera else min(_LOTE_INSERCION, total - hechos)
         tramo = bloques[hechos:hechos + tam]
         infos = [{"mediaPoolItem": tpl, "startFrame": 0,
                   "endFrame": max(1, round((e - s) * fps)),
                   "trackIndex": pista, "recordFrame": f_ini + round(s * fps)}
                  for _, s, e in tramo]
-        items = mp.AppendToTimeline(infos) or []
+        pct = p_ini + (p_fin - p_ini) * hechos / total
+        progreso(pct, f"Insertando lote {lote}/{num_lotes} ({hechos}/{total} subtítulos)…")
+        t0 = time.monotonic()
+        _log(f"[plantilla] AppendToTimeline lote {lote}/{num_lotes} ({len(tramo)} clips), inicio")
+        try:
+            items = mp.AppendToTimeline(infos) or []
+        except Exception as exc:
+            _log(f"[plantilla] AppendToTimeline lote {lote} falló tras {time.monotonic()-t0:.1f}s: {type(exc).__name__}: {exc}")
+            limpiada = _limpiar_pista_insercion(pista)
+            extra = "Se retiró la pista temporal." if limpiada else "Quedaron clips parciales; revisá la pista nueva antes de reintentar."
+            raise RuntimeError(f"Resolve no terminó de insertar los subtítulos (lote {lote}/{num_lotes}). {extra}") from exc
+        _log(f"[plantilla] AppendToTimeline lote {lote} retornó {len(items)}/{len(tramo)} en {time.monotonic()-t0:.1f}s")
         if len(items) != len(tramo):
-            _borrar_items(insertados + list(items))
-            raise RuntimeError("Resolve no pudo insertar todos los títulos de la plantilla seleccionada.")
+            limpiada = _limpiar_pista_insercion(pista)
+            extra = "Se retiró la pista temporal." if limpiada else "Quedaron clips parciales; revisá la pista nueva antes de reintentar."
+            raise RuntimeError(f"Resolve insertó {len(items)}/{len(tramo)} clips en el lote {lote}/{num_lotes}. {extra}")
         insertados.extend(items)
 
-        for item, (texto, _, _) in zip(items, tramo):
+        for indice, (item, (texto, _, _)) in enumerate(zip(items, tramo), 1):
+            _log(f"[plantilla] configurando Text+ del lote {lote}, clip {indice}/{len(tramo)}")
             tool = _textplus_de_item(item)
             if tool is None:
-                _borrar_items(insertados)
+                limpiada = _limpiar_pista_insercion(pista)
+                extra = "Se retiró la pista temporal." if limpiada else "Quedaron clips parciales; revisá la pista nueva."
                 raise RuntimeError(
                     "El elemento elegido no contiene un nodo Text+ editable. "
-                    "Elegí una plantilla de tipo Fusion Title o Text+ del Media Pool.")
+                    "Elegí una plantilla de tipo Fusion Title o Text+. " + extra)
             tool.StyledText = texto
 
         hechos += tam
         primera = False
-        progreso(p_ini + (p_fin - p_ini) * hechos / total,
-                 "Insertando subtítulos en la línea...")
+        pct = p_ini + (p_fin - p_ini) * hechos / total
+        progreso(pct, f"Lote {lote}/{num_lotes} listo ({hechos}/{total} subtítulos).")
         # Deja que Resolve y Tkinter respiren entre tandas.
         time.sleep(0.005)
 
+    _log(f"[plantilla] insertados {len(insertados)}/{total} títulos en {time.monotonic()-inicio_track:.1f}s")
     return len(insertados) == total
 
 
@@ -1251,14 +1748,13 @@ def escribir_transcripcion(pal, off, ruta, titulo):
             frases.append(cur); cur = []
         cur.append(w)
     if cur: frases.append(cur)
-    os.makedirs(os.path.dirname(ruta) or ".", exist_ok=True)
-    with open(ruta, "w", encoding="utf-8") as f:
-        f.write(f"{titulo}\n{len(pal)} palabras\n\n")
-        f.write("TEXTO\n")
-        f.write(" ".join(w[0] for w in pal) + "\n\n")
-        f.write("CON TIEMPOS (min:seg desde el inicio de la timeline)\n")
-        for fr in frases:
-            f.write(f"[{mmss(fr[0][1] + off)}] " + " ".join(w[0] for w in fr) + "\n")
+
+    partes = [f"{titulo}\n{len(pal)} palabras\n\n", "TEXTO\n",
+              " ".join(w[0] for w in pal) + "\n\n",
+              "CON TIEMPOS (min:seg desde el inicio de la timeline)\n"]
+    for fr in frases:
+        partes.append(f"[{mmss(fr[0][1] + off)}] " + " ".join(w[0] for w in fr) + "\n")
+    return _guardar_texto(ruta, "".join(partes))
 
 
 def comparar_con_guion(pal, guion, segs, f_ini, cfg):
@@ -1280,6 +1776,7 @@ def generar(cfg, progreso):
     estilo_trad = cfg.get("estilo_trad", "palabras")
     bloques_trad = None
     aviso_trad = ""
+    aviso_srt = ""
     pistas = [int(p) for p in (cfg.get("pistas") or [cfg.get("pista") or 1])] or [1]
     detalle_pistas = " + ".join(f"A{p}" for p in pistas)
 
@@ -1304,7 +1801,7 @@ def generar(cfg, progreso):
 
     with tempfile.TemporaryDirectory() as tmp:
         progreso(5, f"Extrayendo audio de {detalle_pistas}...")
-        segs = segmentos_audio(pistas, f_ini, f_fin, tmp)
+        segs = segmentos_audio(pistas, f_ini, f_fin, tmp, progreso=progreso)
         if not segs: raise RuntimeError(f"No hay audio en {detalle_pistas} dentro de ese rango.")
         if len(pistas) > 1: progreso(20, f"Mezclando {len(pistas)} pistas en un solo audio...")
         
@@ -1341,10 +1838,20 @@ def generar(cfg, progreso):
             if not pares: aviso_trad = "No hay texto para traducir."
             else:
                 origen = idioma_audio if idioma_audio != "auto" else (_idioma_detectado or "auto")
-                try:
-                    traducciones = traducir_lineas([t for _, t in pares], origen, destino, progreso)
-                    bloques_trad = bloques_traduccion([u for u, _ in pares], traducciones, estilo_trad)
-                except Exception as ex: aviso_trad = f"No pude traducir: {ex}"
+                if origen and origen != "auto" and origen == destino:
+                    aviso_trad = (f"El audio ya está en {NOMBRES_IDIOMA.get(destino, destino)}: "
+                                  "no hace falta una pista traducida.")
+                else:
+                    # Traducir oraciones completas: da gramática y pronombres
+                    # coherentes; después cada oración se reparte en su audio.
+                    oraciones = _agrupar_oraciones([u for u, _ in pares],
+                                                   [t for _, t in pares])
+                    try:
+                        traducciones = traducir_lineas([t for _, t in oraciones], origen,
+                                                       destino, progreso)
+                        bloques_trad = bloques_traduccion([u for u, _ in oraciones],
+                                                          traducciones, estilo_trad)
+                    except Exception as ex: aviso_trad = f"No pude traducir: {ex}"
         if hacer_comp:
             progreso(88, "Comparando con el guion...")
             try: resumen_comp = comparar_con_guion(pal, guion, segs, f_ini, cfg)
@@ -1362,7 +1869,7 @@ def generar(cfg, progreso):
             raiz_txt = os.path.join(carpeta_salida(cfg), _nombre_seguro(TL_NAME))
         ruta_txt = f"{raiz_txt}_transcripcion.txt"
         _respaldar(ruta_txt)
-        escribir_transcripcion(pal, off, ruta_txt, TL_NAME)
+        ruta_txt = escribir_transcripcion(pal, off, ruta_txt, TL_NAME) or ruta_txt
         partes.append(f"TRANSCRIPCIÓN GUARDADA ({len(pal)} palabras)\n{ruta_txt}")
     if hacer_comp and resumen_comp: partes.append(resumen_comp)
 
@@ -1382,12 +1889,21 @@ def generar(cfg, progreso):
             if not b[0]: b[0] = "…"
 
         progreso(91, "Guardando SRT...")
-        escribir_srt([[t, s + off, e + off] for t, s, e in bloques], srt)
+        srt_pedido = srt
+        srt = escribir_srt([[t, s + off, e + off] for t, s, e in bloques], srt) or srt
+        if os.path.normcase(os.path.abspath(srt)) != os.path.normcase(os.path.abspath(srt_pedido)):
+            aviso_srt = (f"El archivo SRT original estaba bloqueado por otro programa.\n"
+                         f"Se guardó una copia como:\n{srt}\n"
+                         f"Si querés reemplazar el original, cerralo y volvé a generar.")
         if ruta_trad:
-            escribir_srt([[t, s + off, e + off] for t, s, e in bloques_trad], ruta_trad)
+            ruta_trad_pedida = ruta_trad
+            ruta_trad = escribir_srt([[t, s + off, e + off] for t, s, e in bloques_trad], ruta_trad) or ruta_trad
+            if os.path.normcase(os.path.abspath(ruta_trad)) != os.path.normcase(os.path.abspath(ruta_trad_pedida)):
+                aviso_srt += (f"\n\nLa traducción también estaba bloqueada; se guardó como:\n{ruta_trad}")
         if solo_srt:
             msg = (f"SRT GENERADO CORRECTAMENTE\n{len(bloques)} subtítulos originales\n{srt}")
             if ruta_trad: msg += (f"\n\nTRADUCCIÓN ({NOMBRES_IDIOMA.get(destino, destino).upper()})\n{len(bloques_trad)} subtítulos\n{ruta_trad}")
+            if aviso_srt: msg += f"\n\n{aviso_srt}"
             if aviso_trad: msg += f"\n\n{aviso_trad}"
             partes.insert(0, msg)
             progreso(100, "\n\n".join(partes))
@@ -1420,6 +1936,7 @@ def generar(cfg, progreso):
                 else: msg = (f"SUBTÍTULOS GENERADOS CORRECTAMENTE\n{len(bloques)} subtítulos en la línea")
             else: msg = (f"SRT GENERADO CORRECTAMENTE\n{len(bloques)} subtítulos.\nEl SRT fue guardado e importado, pero no pude agregarlo automáticamente a la línea.")
         partes.insert(0, msg)
+        if aviso_srt: partes.append(aviso_srt)
         if ruta_trad and ruta_trad not in msg: partes.append(f"TRADUCCIÓN: {ruta_trad}")
         if aviso_trad: partes.append(aviso_trad)
 

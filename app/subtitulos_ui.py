@@ -29,12 +29,16 @@ ESTADOS = {
 IDIOMAS_AUDIO = [
     ("auto", "AUTOMÁTICO"), ("es", "ESPAÑOL"), ("en", "INGLÉS"),
     ("pt", "PORTUGUÉS"), ("fr", "FRANCÉS"), ("it", "ITALIANO"),
-    ("de", "ALEMÁN"),
+    ("de", "ALEMÁN"), ("ja", "JAPONÉS"), ("ko", "COREANO"),
+    ("zh", "CHINO"), ("ru", "RUSO"), ("ar", "ÁRABE"),
+    ("hi", "HINDI"), ("tr", "TURCO"), ("id", "INDONESIO"),
+    ("nl", "NEERLANDÉS"), ("pl", "POLACO"), ("sv", "SUECO"),
+    ("uk", "UCRANIANO"), ("vi", "VIETNAMITA"), ("th", "TAILANDÉS"),
+    ("he", "HEBREO"), ("el", "GRIEGO"), ("cs", "CHECO"),
+    ("ro", "RUMANO"), ("hu", "HÚNGARO"), ("da", "DANÉS"),
+    ("fi", "FINÉS"), ("no", "NORUEGO"),
 ]
-IDIOMAS_DESTINO = [
-    ("es", "ESPAÑOL"), ("en", "INGLÉS"), ("pt", "PORTUGUÉS"),
-    ("fr", "FRANCÉS"), ("it", "ITALIANO"), ("de", "ALEMÁN"),
-]
+IDIOMAS_DESTINO = [par for par in IDIOMAS_AUDIO if par[0] != "auto"]
 
 
 def _corto(texto, limite=46):
@@ -211,6 +215,7 @@ class SubtitulosApp:
         self.track_rows = []
         self._signature_pistas = None
         self._busy = False
+        self._resultado_final = ""
         self._closing = False
         self._revealed = False
         self._alpha_ok = True
@@ -1253,6 +1258,7 @@ class SubtitulosApp:
                             else "frases"),
         }
         self._busy = True
+        self._resultado_final = ""
         self._cancelando = False
         self.cta.set_enabled(False)
         self.cta.set_text("PROCESANDO…")
@@ -1287,24 +1293,32 @@ class SubtitulosApp:
                 evento = self._cola.get_nowait()
                 if evento[0] == "prog":
                     _, p, msg = evento
-                    self.meter.set(p / 100.0)
                     if p >= 100:
-                        alerta = ("No pude traducir" in msg
-                                  or "PARCIAL" in msg or "no se colocó" in msg)
-                        self._set_estado("warn" if alerta else "success", msg)
+                        # 100% puede ser el último lote; sólo el evento "fin"
+                        # confirma que también terminó la llamada a Resolve.
+                        self._resultado_final = msg
+                        self.meter.set(0.99, animate=False)
+                        self._set_estado("working", "Finalizando en DaVinci Resolve…")
                     else:
+                        self.meter.set(p / 100.0)
                         self._set_estado("working", msg)
-                    self._log(msg, "info")
+                        self._log(msg, "info")
                 elif evento[0] == "error":
                     if self._cancelando:
-                        self._set_estado("warn", "Cancelado. No se guardó nada.")
-                        self._log("Proceso cancelado por el usuario.", "cmd")
+                        self._set_estado("warn", "Cancelado. El SRT pudo haberse guardado; revisá si quedaron clips parciales en la timeline.")
+                        self._log("Proceso cancelado por el usuario; revisar SRT y timeline.", "cmd")
                     else:
                         self._set_estado("error", evento[1])
                         self._log("ERROR · " + evento[1], "err")
                     self.meter.set(0, animate=False)
                     self._fin_trabajo()
                 elif evento[0] == "fin":
+                    msg = self._resultado_final or "Proceso finalizado correctamente."
+                    alerta = ("No pude traducir" in msg or "PARCIAL" in msg
+                              or "no se colocó" in msg or "no pude agregarlo" in msg)
+                    self.meter.set(1.0, animate=False)
+                    self._set_estado("warn" if alerta else "success", msg)
+                    self._log(msg, "info")
                     self._fin_trabajo()
                 elif evento[0] == "estado":
                     _, info, pistas, plantillas, force, error = evento

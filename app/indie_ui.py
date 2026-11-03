@@ -11,6 +11,7 @@ antialias y el banner halftone) y animaciones con `after`.
 from __future__ import annotations
 
 import math
+import os
 import time
 import tkinter as tk
 from collections import OrderedDict
@@ -727,6 +728,7 @@ class BrandSelect(tk.Canvas):
         self._root_config_id = None
         self._root_wheel_id = None
         self._root_unmap_id = None
+        self._watch_id = None
         
         self.bind("<Configure>", self._on_configure)
         self.bind("<Enter>", lambda e: self._hov(True))
@@ -793,6 +795,12 @@ class BrandSelect(tk.Canvas):
                          font=(F_BODY, 12, "bold"))
 
     def _close(self, event=None):
+        if self._watch_id is not None:
+            try:
+                self.after_cancel(self._watch_id)
+            except Exception:
+                pass
+            self._watch_id = None
         if self._popup is not None:
             try:
                 self._popup.destroy()
@@ -822,6 +830,38 @@ class BrandSelect(tk.Canvas):
             self._root_config_id = None
             self._root_wheel_id = None
             self._root_unmap_id = None
+
+    def _app_is_foreground(self):
+        """True si la app (o su propio desplegable) sigue en primer plano."""
+        if os.name != "nt":
+            return True
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            user32.GetWindowThreadProcessId.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            return pid.value == os.getpid()
+        except Exception:
+            return True
+
+    def _watch_foreground(self):
+        """Cierra el desplegable en cuanto el usuario cambia a otra ventana."""
+        self._watch_id = None
+        if self._popup is None:
+            return
+        if not self._app_is_foreground():
+            self._close()
+            return
+        try:
+            self._watch_id = self.after(180, self._watch_foreground)
+        except Exception:
+            self._watch_id = None
 
     def _global_click(self, event):
         if self._popup:
@@ -869,6 +909,10 @@ class BrandSelect(tk.Canvas):
         
         # Si el menú pierde el foco (ej. clic en otra app), se cierra
         self._popup.bind("<FocusOut>", lambda e: self._close())
+
+        # En Windows el Toplevel overrideredirect no siempre recibe FocusOut.
+        # Vigilamos la ventana activa: al cambiar a Resolve u otra app, se cierra.
+        self._watch_id = self.after(180, self._watch_foreground)
         
         # --- NUEVOS BINDS PARA EVITAR EL "BUGEo" ---
         root = self.winfo_toplevel()

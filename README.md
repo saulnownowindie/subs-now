@@ -1,8 +1,9 @@
 # Indie Now · Subtítulos
 
 Generador de subtítulos para **DaVinci Resolve** a partir de una timeline o de un guion.
-Transcribe con Whisper (faster-whisper, GPU si hay), compara contra el guion, arma el SRT
-y lo aplica como pista de subtítulos usando una plantilla del Media Pool.
+Transcribe con Whisper (faster-whisper, GPU si hay), compara contra el guion, arma el SRT,
+lo aplica como pista de subtítulos usando una plantilla del Media Pool y, si hace falta,
+crea una segunda pista traducida.
 
 Interfaz propia con la estética de Indie Now: fondo casi negro, tarjetas redondeadas y
 acento amarillo `#FFF333`. Nada de consolas negras ni de pasos a mano.
@@ -29,7 +30,7 @@ El instalador deja todo listo:
 | 3 | Instala faster-whisper, ctranslate2, av, tokenizers, numpy, Pillow y python-docx (~600 MB). |
 | 4 | Instala **FFmpeg** con winget (esta herramienta no funciona sin él). |
 | 5 | Copia la app a `%LOCALAPPDATA%\IndieDL\subs`. |
-| 6 | Agrega el lanzador al menú **Scripts → Utility** de Resolve y crea accesos directos. |
+| 6 | Copia el lanzador a **Fusion → Scripts → Edit → SubsSaul** y crea accesos directos. |
 
 Es idempotente: podés volver a ejecutarlo cuando actualices con `git pull`.
 
@@ -46,33 +47,59 @@ Es idempotente: podés volver a ejecutarlo cuando actualices con `git pull`.
 ## Uso
 
 1. Abrí Resolve con tu proyecto y timeline.
-2. Entrá por **Workspace → Scripts → Utility → Indie Now - Subtitulos**
-   (o el acceso directo «Indie Now Subtitulos»).
+2. Entrá por **Fusion → Scripts → Edit → SubsSaul**
+   (o el acceso directo “Indie Now Subtítulos”; también sirve `Iniciar Subtitulos.bat`).
 3. Elegí qué hacer: subtítulos, `.txt`, comparar con guion, o sólo SRT.
 4. Marcá las pistas de audio, el rango (In/Out o timeline completa) y la plantilla.
    El selector muestra **solo** plantillas con texto (Fusion Title o Text+); las capas
    de ajuste, luces y zooms del Media Pool no aparecen aunque estén en una carpeta
-   "plantillas".
+   “plantillas”.
 5. **GENERAR SUBTÍTULOS**. Hay botón **CANCELAR** mientras corre.
 
-La primera transcripción descarga el modelo de Whisper (~500 MB) y tarda más; las
-siguientes arrancan al toque porque queda en caché.
+La primera transcripción descarga el modelo de Whisper (`large-v3-turbo`, ~1.5 GB) y tarda
+más; las siguientes arrancan al toque porque queda en caché.
 
 ### Rango
 
 - **SOLO IN / OUT**: usa las marcas de entrada y salida de la timeline.
 - **TODA LA LÍNEA**: procesa la timeline completa.
 
+### Idioma y traducción
+
+- **Idioma del audio**: `AUTOMÁTICO` (lo detecta Whisper sobre varias ventanas del audio)
+  o cualquiera de los 28 idiomas de la lista.
+- **Traducir los subtítulos**: activa una segunda salida traducida con Google Translate.
+  - **PALABRAS**: cada subtítulo traducido respeta el bloque original (mismo corte).
+  - **FRASES**: agrupa oraciones completas antes de traducir y después reparte el texto
+    entre los bloques según su duración real de audio.
+  - La traducción va a su **propia pista de video**, así podés mostrar la original o la
+    traducida sin regenerar nada. Si el idioma destino es igual al del audio, la app avisa
+    y no duplica la pista.
+
 ### Dónde se guarda
 
-- El **SRT** va a la ruta de la tarjeta «DÓNDE GUARDAR» (o junto al guion / en Documentos
-  si no elegiste ninguna).
+- El **SRT** va a la ruta de la tarjeta “DÓNDE GUARDAR” (o junto al guion / en Documentos
+  si no elegiste ninguna). La versión traducida se guarda al lado con el código del idioma:
+  `black parade.srt` → `black parade_EN.srt`.
 - La **transcripción `.txt`** se guarda al lado del SRT y toma su nombre:
   `black parade.srt` → `black parade_transcripcion.txt`. El chip de la tarjeta muestra
   el nombre exacto antes de ejecutar.
 - Si el archivo ya existía, **no se borra**: la versión anterior queda como respaldo con
   fecha (`black parade_transcripcion.20261027-154902.txt.bak`). Podés generar la misma
   timeline las veces que quieras que no perdés nada.
+
+### Calidad de los subtítulos
+
+- Whisper detecta el idioma sobre una ventana de 90 s del clip más largo (no sobre los
+  primeros segundos, que suelen ser música) y usa `large-v3-turbo` con timestamps por
+  palabra. Se descartan anotaciones sin diálogo (`[Música]`, `(risas)`, `♪`) y se podan
+  bucles o alucinaciones repetidas.
+- Los bloques se ajustan a voz real (sin contar silencios) y se limitan a **2 líneas de
+  42 caracteres**.
+- Se aplica tiempo de lectura (~17 caracteres por segundo) para que ningún subtítulo
+  desaparezca antes de que se pueda leer.
+- En clips con retime (velocidad, inverso) el audio se mapea al tiempo real de la
+  timeline antes de transcribir, así los subtítulos quedan sincronizados.
 
 ---
 
@@ -104,6 +131,17 @@ Queda en `dist\IndieNow-Subtitulos\`. Usa el entorno virtual de
 
 ---
 
+## Tests
+
+```powershell
+%LOCALAPPDATA%\IndieDL\venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Los tests leen `app\subtitulos.py` y verifican alineación, retime y armado de bloques sin
+necesidad de Resolve ni de audio.
+
+---
+
 ## Dónde quedan las cosas
 
 | Qué | Dónde |
@@ -111,8 +149,9 @@ Queda en `dist\IndieNow-Subtitulos\`. Usa el entorno virtual de
 | Programa | `%LOCALAPPDATA%\IndieDL\subs\` |
 | Entorno virtual | `%LOCALAPPDATA%\IndieDL\venv\` |
 | Configuración | `%LOCALAPPDATA%\IndieDL\subs\subtitulos_config.json` |
-| Log | `%LOCALAPPDATA%\IndieDL\subs\subtitulos.log` |
-| Lanzador de Resolve | `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\Indie Now - Subtitulos.py` |
+| Log de la app | `%LOCALAPPDATA%\IndieDL\subs\subtitulos.log` |
+| Log del lanzador | `%LOCALAPPDATA%\IndieDL\subs\lanzador.log` |
+| Lanzador de Resolve | `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Edit\SubsSaul.py` |
 | Modelos de Whisper | caché de Hugging Face (`%USERPROFILE%\.cache\huggingface`) |
 
 Nada de eso vive en el repo: configuración, logs y binarios están en `.gitignore`.
@@ -124,17 +163,21 @@ Nada de eso vive en el repo: configuración, logs y binarios están en `.gitigno
 ```
 subs-now/
 ├─ app/
-│  ├─ subtitulos.py            # lógica: Resolve, Whisper, SRT, plantillas
+│  ├─ subtitulos.py            # lógica: Resolve, Whisper, traducción, SRT, plantillas
 │  ├─ subtitulos_ui.py         # interfaz (arranque animado, estado, registro)
 │  ├─ indie_ui.py              # kit visual compartido (tarjetas, botones, scroll)
 │  ├─ mezcla_audio.py          # mezcla y normalización del audio extraído
 │  ├─ gpu_runtime.py           # detección de CUDA y librerías de GPU
 │  ├─ verificacion.py          # comparación contra el guion
 │  ├─ verificar.py             # utilidad de verificación
-│  └─ cortes.py                # utilidades de corte
+│  ├─ cortes.py                # utilidades de corte
+│  ├─ SubsSaul.py              # lanzador para Fusion → Scripts → Edit
+│  ├─ app.manifest             # manifiesto de Windows para el build
+│  └─ subtitulos_config.json.example
 ├─ installer/
-│  ├─ instalar.ps1             # lógica del instalador
-│  └─ Indie Now - Subtitulos.py   # lanzador para el menú Scripts de Resolve
+│  └─ instalar.ps1             # lógica del instalador
+├─ tests/
+│  └─ test_subtitulos_alineacion.py
 ├─ requirements.txt
 ├─ requirements-dev.txt
 ├─ INSTALAR.bat
@@ -147,13 +190,18 @@ subs-now/
 
 ## Problemas comunes
 
-**«No se pudo conectar con DaVinci Resolve»**
+**“No se pudo conectar con DaVinci Resolve”**
 Resolve tiene que estar abierto con un proyecto. Verificá el scripting externo en
 `Preferencias → Sistema → General → External scripting using = Local` y reiniciá Resolve.
 
-**«No encontré: ffmpeg»**
+**“No encontré: ffmpeg”**
 `winget install --id Gyan.FFmpeg -e` y volvé a abrir la app. El instalador también lo
 resuelve solo.
+
+**Desde Resolve no pasa nada**
+Mirá `%LOCALAPPDATA%\IndieDL\subs\lanzador.log`: ahí queda qué ejecutable intentó abrir y
+por qué falló. El lanzador busca primero el `.exe` compilado y después
+`%LOCALAPPDATA%\IndieDL\venv\Scripts\pythonw.exe`.
 
 **La app abre pero no ve la timeline**
 Cerrá la app y volvé a abrirla con la timeline activa. El nombre de la timeline se lee al
@@ -162,6 +210,10 @@ arrancar y se refresca cada pocos segundos.
 **Transcribe lento**
 Está usando CPU. Con una GPU NVIDIA, `gpu_runtime.py` detecta CUDA automáticamente; si
 falla, la app lo informa en el registro y sigue en CPU.
+
+**La traducción repite o corta palabras**
+Probá **FRASES** en vez de **PALABRAS**: agrupa oraciones completas y reparte el texto
+según la duración real de cada bloque.
 
 **Un `.exe` viejo no tiene los cambios**
 El flujo normal no usa el `.exe`: Resolve lanza el código instalado. Recompilá solo si
@@ -173,6 +225,8 @@ necesitás el ejecutable suelto.
 
 - Probado en Windows 11 con Python 3.12, Resolve 18/19 y `faster-whisper` 1.2.
 - La ventana se arma completa antes de mostrarse y aparece con un fundido corto: no se ve
-  el armado ni textos de «Cargando…».
+  el armado ni textos de “Cargando…”.
 - El scroll de los paneles es propio (rueda suave sobre cualquier tarjeta) y el registro
   tiene scroll independiente.
+- Este repo es la única fuente de la herramienta de subtítulos: Indie Now DL sólo la
+  invoca desde Resolve.
