@@ -255,6 +255,7 @@ class SubtitulosApp:
         self.v_estilo = tk.StringVar(
             value="PALABRAS" if self.cfg.get("estilo_trad", "palabras") == "palabras"
             else "FRASES")
+        self.v_terminos = tk.StringVar(value=str(self.cfg.get("terminos") or ""))
         if self.v_solo.get():
             self.v_subs.set(False)
             self.v_txt.set(False)
@@ -686,7 +687,7 @@ class SubtitulosApp:
         iu.autowrap(self.lbl_tpl_note, extra=10)
 
     def _build_traduccion(self):
-        card, body, hint = self._section(self.col_right, 6, "TRADUCCIÓN", "GOOGLE")
+        card, body, hint = self._section(self.col_right, 6, "TRADUCCIÓN", "GOOGLE + CONTEXTO")
         self.hint_trad = hint
         self.chk_trad = iu.BrandCheck(
             body, "Traducir los subtítulos a otro idioma", self.v_trad,
@@ -716,6 +717,15 @@ class SubtitulosApp:
                                       justify="left")
         self.lbl_trad_note.pack(fill="x", pady=(8, 0))
         iu.autowrap(self.lbl_trad_note, extra=10)
+
+        tk.Label(body, text="Nombres y términos a no traducir (coma separada)",
+                 bg=iu.SURFACE, fg=iu.MUTED, font=(iu.F_SEMI, 9)).pack(anchor="w", fill="x", pady=(10, 6))
+        self.entr_terminos = tk.Entry(
+            body, bg=iu.SURFACE, fg=iu.TEXT, insertbackground=iu.YEL, relief="flat",
+            font=(iu.F_BODY, 9), bd=0, highlightthickness=0)
+        self.entr_terminos.pack(fill="x", pady=(0, 6))
+        self.entr_terminos.insert(0, str(self.v_terminos.get()))
+        self.entr_terminos.bind("<KeyRelease>", self._guardar)
 
     def _build_estado(self):
         card = self._card(self.host_state, pady=(0, 12))
@@ -865,6 +875,7 @@ class SubtitulosApp:
             "idioma_destino": self._cod_destino.get(self.v_destino.get(), "es"),
             "estilo_trad": ("palabras" if self.v_estilo.get() == "PALABRAS"
                             else "frases"),
+            "terminos": str(self.v_terminos.get() or "").strip(),
         }
         try:
             self.backend.guardar(cfg)
@@ -1086,7 +1097,7 @@ class SubtitulosApp:
         self.chk_trad.set_enabled(puede)
         self.sel_destino.set_enabled(activo)
         self.seg_estilo.set_enabled(activo)
-        self.hint_trad.configure(text="GOOGLE" if puede else "SOLO SUBS")
+        self.hint_trad.configure(text="GOOGLE + CONTEXTO" if puede else "SOLO SUBS")
         if not puede:
             nota = "Solo disponible cuando generás subtítulos."
         elif not self.v_trad.get():
@@ -1094,7 +1105,7 @@ class SubtitulosApp:
                     "El original no se toca.")
         else:
             nota = ("Whisper transcribe el audio y Google traduce esos subtítulos "
-                    "por frases, en bloques cortos. El original no se toca. "
+                    "por bloques con contexto, en bloques cortos. El original no se toca. "
                     "Requiere internet.")
             if self.v_guion.get():
                 nota += (" El guion es opcional y solo corrige nombres: tiene que "
@@ -1256,6 +1267,7 @@ class SubtitulosApp:
             "idioma_destino": self._cod_destino.get(self.v_destino.get(), "es"),
             "estilo_trad": ("palabras" if self.v_estilo.get() == "PALABRAS"
                             else "frases"),
+            "terminos": str(self.v_terminos.get() or "").strip(),
         }
         self._busy = True
         self._resultado_final = ""

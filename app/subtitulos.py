@@ -20,10 +20,6 @@ import wave
 import time
 import traceback
 import gc
-import urllib.error
-import urllib.parse
-import urllib.request
-
 import tkinter as tk
 from tkinter import messagebox
 
@@ -32,6 +28,7 @@ import numpy as np
 import indie_ui
 import mezcla_audio
 import gpu_runtime
+import traduccion_google as tg
 from subtitulos_ui import SubtitulosApp
 
 try:
@@ -1118,111 +1115,21 @@ def escribir_srt(bloques, path):
 
 
 _FIN_FRASE = re.compile(r"[.!?…][\"'”’)\]]*$")
-_TRAD_CACHE = None
+
+
+_TG = tg.TraductorGoogle(cache_path=CACHE_TRAD_FILE, timeout=25)
 
 
 def _cache_trad_cargar():
-    global _TRAD_CACHE
-    if _TRAD_CACHE is None:
-        _TRAD_CACHE = {}
-        try:
-            if os.path.exists(CACHE_TRAD_FILE):
-                with open(CACHE_TRAD_FILE, encoding="utf-8") as f:
-                    datos = json.load(f)
-                if isinstance(datos, dict): _TRAD_CACHE = {str(k): str(v) for k, v in datos.items()}
-        except Exception: _TRAD_CACHE = {}
-    return _TRAD_CACHE
+    return _TG.cache()
 
 
 def _cache_trad_guardar():
-    if _TRAD_CACHE is None: return
-    try:
-        recorte = dict(list(_TRAD_CACHE.items())[-8000:])
-        with open(CACHE_TRAD_FILE, "w", encoding="utf-8") as f:
-            json.dump(recorte, f, ensure_ascii=False)
-    except Exception: pass
+    _TG.guardar()
 
 
-def _google_pedir(texto, origen, destino, timeout=25):
-    params = urllib.parse.urlencode({"client": "gtx", "sl": origen or "auto", "tl": destino, "dt": "t"})
-    datos = urllib.parse.urlencode({"q": texto}).encode("utf-8")
-    req = urllib.request.Request(
-        "https://translate.googleapis.com/translate_a/single?" + params,
-        data=datos,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _google_una(texto, origen, destino, timeout=25):
-    ultimo = None
-    for intento in range(3):
-        try:
-            data = _google_pedir(texto, origen, destino, timeout)
-            partes = [seg[0] for seg in (data[0] or []) if seg and seg[0]]
-            salida = "".join(partes).strip("\n")
-            if salida: return salida
-        except urllib.error.HTTPError as exc:
-            ultimo = exc
-            if exc.code == 429: time.sleep(1.2 * (intento + 1)); continue
-        except Exception as exc: ultimo = exc
-        if intento < 2: time.sleep(0.7 * (intento + 1))
-    raise RuntimeError(f"Google Translate no respondió: {ultimo}")
-
-
-def _google_lote(lineas, origen, destino, timeout=25):
-    q = "\n".join(lineas)
-    ultimo = None
-    for intento in range(3):
-        try:
-            data = _google_pedir(q, origen, destino, timeout)
-            texto = "".join(seg[0] for seg in (data[0] or []) if seg and seg[0])
-            salida = texto.split("\n")
-            while salida and not salida[-1].strip(): salida.pop()
-            if len(salida) == len(lineas): return [x.strip() for x in salida]
-            return [_google_una(l, origen, destino, timeout) for l in lineas]
-        except urllib.error.HTTPError as exc:
-            ultimo = exc
-            if exc.code == 429: time.sleep(1.2 * (intento + 1)); continue
-        except Exception as exc: ultimo = exc
-        if intento < 2: time.sleep(0.7 * (intento + 1))
-    raise RuntimeError(f"Google Translate no respondió: {ultimo}")
-
-
-def traducir_lineas(lineas, origen, destino, progreso=None):
-    limpio = [re.sub(r"\s+", " ", str(x)).strip() for x in lineas]
-    cache = _cache_trad_cargar()
-    salida = [None] * len(limpio)
-    pendientes = []
-    for i, texto in enumerate(limpio):
-        if not texto: salida[i] = ""; continue
-        clave = f"{origen}>{destino}|{texto}"
-        if clave in cache: salida[i] = cache[clave]
-        else: pendientes.append((i, texto))
-    total = len(pendientes)
-    hechos = 0
-    i = 0
-    while i < total:
-        lote = []
-        caracteres = 0
-        # Oraciones completas: menos viajes y más contexto por llamada.
-        while i < total and len(lote) < 16 and (caracteres < 3000 or not lote):
-            item = pendientes[i]
-            lote.append(item)
-            caracteres += len(item[1]) + 1
-            i += 1
-        resultado = _google_lote([t for _, t in lote], origen, destino)
-        if len(resultado) != len(lote): raise RuntimeError("La traducción no devolvió la misma cantidad de líneas.")
-        for (indice, texto), trad in zip(lote, resultado):
-            trad = re.sub(r"\s+", " ", (trad or "")).strip() or texto
-            cache[f"{origen}>{destino}|{texto}"] = trad
-            salida[indice] = trad
-        hechos += len(lote)
-        if progreso: progreso(84 + 4 * hechos / max(1, total), f"Traduciendo al {NOMBRES_IDIOMA.get(destino, destino)}...")
-        if i < total: time.sleep(0.25)
-    _cache_trad_guardar()
-    return [s if s is not None else limpio[k] for k, s in enumerate(salida)]
+def traducir_lineas(lineas, origen, destino, progreso=None, terminos=()):
+    return _TG.traducir(lineas, origen, destino, terminos=list(terminos or ()), progreso=progreso)
 
 
 def agrupar_frases(palabras, max_palabras=14, max_dur=7.0, pausa=0.85):
@@ -1805,11 +1712,12 @@ def generar(cfg, progreso):
         if not segs: raise RuntimeError(f"No hay audio en {detalle_pistas} dentro de ese rango.")
         if len(pistas) > 1: progreso(20, f"Mezclando {len(pistas)} pistas en un solo audio...")
         
-        nombres = nombres_del_guion(guion)
+        nombres = nombres_del_guion(guion) if guion else []
         glos = glosario_del_guion(texto_guion) if texto_guion else []
         for n in nombres:
             if n.lower() not in {x.lower() for x in glos}: glos.append(n)
         prompt = ", ".join(glos)[:400]
+        terminos = traduccion_google.normalizar_terminos(glos, texto_guion, cfg.get("terminos", ""))
         pal = transcribir(segs, prompt, progreso, p_ini=30, p_fin=90, idioma=idioma_audio,
                           con_guion=bool(guion), hotwords=", ".join(glos)[:200])
         
@@ -1848,7 +1756,7 @@ def generar(cfg, progreso):
                                                    [t for _, t in pares])
                     try:
                         traducciones = traducir_lineas([t for _, t in oraciones], origen,
-                                                       destino, progreso)
+                                                       destino, progreso, terminos=terminos)
                         bloques_trad = bloques_traduccion([u for u, _ in oraciones],
                                                           traducciones, estilo_trad)
                     except Exception as ex: aviso_trad = f"No pude traducir: {ex}"

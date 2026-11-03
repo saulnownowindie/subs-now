@@ -76,6 +76,12 @@ más; las siguientes arrancan al toque porque queda en caché.
     traducida sin regenerar nada. Si el idioma destino es igual al del audio, la app avisa
     y no duplica la pista.
 
+- **Contexto, glosario y memoria**: el motor de traducción agrupa las oraciones en
+  ventanas de contexto antes de pedir el lote a Google, protege los nombres propios y
+  términos (cargados desde el guion o desde el campo del usuario) con tokens internos y
+  reutiliza la memoria de frases ya traducidas. Con eso, las traducciones de una misma
+  charla no quedan aisladas ni inconsistentes entre bloques.
+
 ### Dónde se guarda
 
 - El **SRT** va a la ruta de la tarjeta “DÓNDE GUARDAR” (o junto al guion / en Documentos
