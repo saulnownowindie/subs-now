@@ -590,98 +590,230 @@ def construir(cortes_f, pista_audio, pista_video, otras):
 
 
 
-# ---------- Orquestacion del mini-proyecto v2 ----------
+# ---------- Proceso principal ----------
 
-def alertas_transcripcion(T, niveles=None, umbral=18.0):
-    """Alertas del proceso para decidir cortes automaticos:
-       - silencios entre frases grandes.
-       - frases que son solo lectura (volumen bajo respecto al nivel local).
-       - repeticiones internas (intentos viejos) -> se descartan, siempre agarra la ultima toma.
-       Devuelve lista de dicts: {tipo, inicio, fin, palabra}."""
-    alertas = []
-    if not T:
-        return alertas
-    for frase in dividir_en_frases(T):
-        palabras = [T[k] for k in frase]
-        ini, fin = palabras[0][1], palabras[-1][2]
-        if niveles is not None and len(palabras) >= 1:
-            lv = niveles[frase[0]]
-            if not np.isfinite(lv) or lv < umbral:
-                alertas.append({
-                    "tipo": "silencio" if not np.isfinite(lv) else "lectura",
-                    "inicio": float(ini), "fin": float(fin), "palabra": palabras[0][3],
-                })
-                continue
-        if (float(fin) - float(ini)) < 0.4:
-            alertas.append({"tipo": "silencio", "inicio": float(ini), "fin": float(fin), "palabra": palabras[0][3]})
-    return alertas
-
-
-def cortes_validos(T, cortes_f, guion_texto, indice):
-    """Valida cortes contra el guion: no cortan palabras a la mitad y la escritura se parece a un
-       fragmento del guion (orden + escritura). Devuelve (validos, descartados).
-       Validos: (ini, fin, words, cob)."""
-    ok, detalle = [], []
-    Gn = [w[0] for w in palabras_del_guion(guion_texto) if len(w[0]) >= 3]
-    for ini, fin in cortes_f:
-        words = [w for w in T if w[1] < fin and w[2] > ini]
-        if not words:
-            detalle.append((ini, fin, "sin audio")); continue
-        if any(T[i][2] > T[i + 1][1] for i in range(len(words) - 1)):
-            detalle.append((ini, fin, "corta palabras")); continue
-        ini2, cob = ubicar([w[0] for w in words], Gn, indice) if len(words) >= 2 else (None, 0.0)
-        ok.append((ini, fin, words, cob))
-    return ok, detalle
-
-
-def armar_cortes(palabras):
-    """Genera cortes automaticos desde la transcripcion:
-       1) descarta intentos/reinicios viejos y se queda con la ULTIMA toma;
-       2) arma cortes entre palabras (nunca a mitad de palabra) agrupando por pausa;
-       3) cada corte se arma como ventana completa (PRE/POST) sobre palabras solidas."""
-    Tn = igualar_al_guion(palabras, [])
-    idx = list(range(len(palabras)))
-    idx, _intentos = sin_reinicios(idx, Tn, palabras)
-    return cortes_de(palabras, idx, PAUSA_FRASE)
-
-
-def run(cfg, progreso, reporte):
-    """Flujo v2: transcribir -> alertas -> cortes (ultima toma) -> validar contra guion -> timeline nueva."""
-    guion = cfg.get("guion") or ""
+def correr(cfg, progreso, reporte):
+    """Flujo completo: transcribir -> alertas/lecturas -> tomas repetidas -> cortes -> timeline -> marcadores -> informe."""
+    import numpy as np
+    progreso(2, "Leyendo guion...")
+    G = palabras_del_guion(leer_guion(cfg["guion"])) if cfg.get("guion") else []
+    Gn = [n for n, _ in G]
     indice = {}
-    for i, (n, _d) in enumerate(palabras_del_guion(guion)):
-        indice.setdefault(n, []).append(i)
-    progreso(5, "Transcribiendo con Whisper...")
-    segs = segmentos_audio(list(cfg.get("pistas") or [1]), float(cfg.get("inicio", 0.0)),
-                           float(cfg.get("fin", 3600.0)), tempfile.mkdtemp())
-    palabras, envs = transcribir(segs, cfg.get("prompt") or "", lambda p, m: progreso(int(p), m))
-    palabras = refinar(palabras, envs)
-    progreso(60, "Analizando...")
-    niv = niveles(palabras, envs) if envs else None
-    alertas = alertas_transcripcion(palabras, niv)
-    progreso(75, f"Generando cortes con {len(alertas)} alertas...")
-    candidatos = armar_cortes(palabras)
-    progreso(80, f"Generando {len(candidatos)} cortes candidatos...")
-    validos, descartados = cortes_validos(palabras, candidatos, guion, indice)
-    cortes_f = [(ini, fin) for ini, fin, _w, _cob in validos]
-    progreso(90, f"{len(cortes_f)} cortes validados contra el guion ({len(descartados)} descartados).")
-    progreso(95, "Armando timeline nueva con los cortes validados...")
-    tl, ok_v, ok_a, nv, na, ne = construir([(round(ini * FPS), round(fin * FPS)) for ini, fin in cortes_f],
-                                         cfg.get("pista_audio") or 1, cfg.get("pista_video") or 1,
-                                         cfg.get("otras") or [])
-    for ini, fin, words, cob in validos:
-        try:
-            poner_marca(tl, round(ini * FPS), C_ORDEN, f"Corte @{mmss(ini)}", f"Guion ({len(words)} palabras)", max(1, round((fin - ini) * FPS)), CUSTOM)
-        except Exception:
-            pass
-    for ini, fin, motivo in descartados:
-        try:
-            poner_marca(tl, round(ini * FPS), C_DIFIERE, f"Descartado @{mmss(ini)}", str(motivo), max(1, round((fin - ini) * FPS)), CUSTOM)
-        except Exception:
-            pass
-    progreso(100, f"Listo: {len(cortes_f)} cortes (video ok: {ok_v}, audio ok: {ok_a}).")
-    return {"cortes": cortes_f, "validos": validos, "descartados": descartados, "alertas": alertas, "timeline": tl}
+    for p, n in enumerate(Gn):
+        indice.setdefault(n, []).append(p)
+    formas = formas_del_guion(G)
+
+    mi = timeline.GetMarkInOut() or {}
+    ai = mi.get("audio") or mi.get("video") or {}
+    if cfg.get("rango") == "inout" and ai:
+        f_ini, f_fin = ai["in"], ai["out"]
+    else:
+        f_ini, f_fin = TL_START, timeline.GetEndFrame()
+
+    prompt = ""
+    if G:
+        nombres = nombres_del_guion(G)
+        cab = ("Nombres: " + ", ".join(nombres) + ". ") if nombres else ""
+        prompt = (cab[:300] + " ".join(d for _, d in G))[:600]
+    clave = clave_cache(cfg.get("pista") or 1, f_ini, f_fin, prompt)
+    datos = cache_leer(clave) if cfg.get("cache") else None
+    if datos:
+        T, envs = datos
+        progreso(80, "Usando la transcripcion guardada...")
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            progreso(5, "Extrayendo audio del microfono...")
+            segs = segmentos_audio(cfg.get("pista") or 1, f_ini, f_fin, tmp)
+            if not segs:
+                raise RuntimeError("No hay audio en esa pista/rango.")
+            progreso(30, "Cargando modelo...")
+            T, envs = transcribir(segs, prompt, progreso)
+        if T:
+            cache_guardar(clave, (T, envs))
+    if not T:
+        raise RuntimeError("No se transcribio nada.")
+    T = refinar(T, envs)
+    Tn = igualar_al_guion(T, G)
+    niv = niveles(T, envs)
+
+    progreso(82, "Analizando frases, volumen y tomas repetidas...")
+    utts = dividir_en_frases(T)
+    infos = []
+    for idx in utts:
+        ws = [Tn[k] for k in idx]
+        pos, cob = ubicar(ws, Gn, indice)
+        infos.append({"idx": idx, "t": (T[idx[0]][1] + T[idx[-1]][2]) / 2,
+                      "nivel": float(np.median([niv[k] for k in idx])) if niv else 0.0,
+                      "gpos": pos, "gs": cob})
+    usar_volumen = bool(niv) and float(cfg.get("bajada") or 0) > 0
+    if infos:
+        referencias(infos)
+
+    lecturas = []
+    for u in infos:
+        u["caida"] = u["ref"] - u["nivel"] if usar_volumen else 0.0
+        n = len(u["idx"])
+        u["lectura"] = bool(usar_volumen and n >= 2 and (
+            u["caida"] >= float(cfg.get("bajada") or 0) or
+            (u["caida"] >= float(cfg.get("bajada") or 0) * 0.6 and u["gs"] >= 0.9 and n >= 4)))
+        if u["lectura"]:
+            lecturas.append(u)
+
+    grupos = []
+    for u in infos:
+        if u["lectura"]:
+            continue
+        idx, quit_ = sin_reinicios(u["idx"], Tn, T)
+        if not idx:
+            continue
+        flags_u = []
+        if quit_:
+            txt_q = " | ".join(" ".join(formas.get(Tn[k]) or limpiar(T[k][3]) for k in q) for q in quit_)
+            flags_u.append((C_DUDA, "REINICIO DENTRO DE LA FRASE", "Saqué un intento viejo de esta frase: " + txt_q[:200]))
+        ws = [Tn[k] for k in idx]
+        mejor = None
+        for gi in range(len(grupos) - 1, max(-1, len(grupos) - 1 - LOOKBACK), -1):
+            g = grupos[gi]
+            if T[idx[0]][1] - T[g["idx"][-1]][2] > VENTANA_T:
+                continue
+            cob, m = solapan(ws, [Tn[k] for k in g["idx"]])
+            if m >= 2 and cob >= UMBRAL_REPETIDA and (mejor is None or cob > mejor[0]):
+                mejor = (cob, gi)
+        if mejor:
+            g = grupos[mejor[1]]
+            antes = len(g["idx"])
+            g["tomas"] += 1
+            g["idx"], g["u"] = idx, u
+            g["flags"] = list(flags_u)
+            if len(idx) < 0.6 * antes:
+                g["flags"].append((C_DUDA, "ULTIMA TOMA MAS CORTA", f"Usé la última de {g['tomas']} tomas, pero es bastante más corta que la anterior."))
+            elif mejor[0] < FLAG_COBERTURA:
+                g["flags"].append((C_DUDA, "TOMAS DISTINTAS", f"Usé la última de {g['tomas']} tomas, pero no son idénticas. Revisá."))
+        else:
+            grupos.append({"idx": idx, "u": u, "tomas": 1, "flags": list(flags_u)})
+    if not grupos:
+        raise RuntimeError("No quedó ninguna toma válida. Probá bajar el ajuste de volumen.")
+
+    maxp = -1
+    for g in grupos:
+        u = g["u"]
+        if G and u["gpos"] is not None and u["gs"] >= 0.5:
+            if u["gpos"] + 30 < maxp:
+                g["flags"].append((C_ORDEN, "FUERA DE ORDEN", "Esta frase está ANTES en el guion de lo que ya se dijo. Revisá el orden."))
+            maxp = max(maxp, u["gpos"] + len(g["idx"]))
+        elif G and u["gs"] < 0.35 and len(g["idx"]) >= 4:
+            g["flags"].append((C_DIFIERE, "NO ESTA EN EL GUION", "Se dijo algo que no se parece al guion (improvisado o cambiado)."))
+
+    por_grupo, cortes = [], []
+    for g in grupos:
+        cs = cortes_de(T, g["idx"], float(cfg.get("pausa") or 0.5))
+        por_grupo.append(cs)
+        cortes += cs
+    unidos = []
+    for a, b in cortes:
+        if unidos and -0.02 <= a - unidos[-1][1] <= 0.15:
+            unidos[-1] = (unidos[-1][0], max(unidos[-1][1], b))
+        else:
+            unidos.append((a, b))
+    cortes_f = []
+    for a, b in unidos:
+        fa, fb = f_ini + round(a * FPS), f_ini + round(b * FPS)
+        fa, fb = max(f_ini, fa), min(f_fin, fb)
+        if fb > fa:
+            cortes_f.append((fa, fb))
+
+    progreso(90, "Armando timeline nueva...")
+    nueva, ok_v, ok_a, nv, na, ne = construir(cortes_f, cfg.get("pista") or 1, cfg.get("video") or 1, cfg.get("otras") or [])
+
+    progreso(96, "Poniendo marcadores...")
+    cuenta, fallos = Counter(), 0
+    pos_grupo = []
+    for g, cs in zip(grupos, por_grupo):
+        pos = pos_en_nueva(cortes_f, f_ini + round(cs[0][0] * FPS) + 1) if cs else None
+        pos_grupo.append(pos)
+        for color, nombre, nota in g["flags"]:
+            if pos is not None and poner_marca(nueva, pos, color, nombre, nota):
+                cuenta[color] += 1
+            else:
+                fallos += 1
+
+    final_idx = [k for g in grupos for k in g["idx"]]
+    final_n = [Tn[k] for k in final_idx]
+    rep = [VERSION]
+    n_rep = sum(g["tomas"] - 1 for g in grupos)
+    rep.append(f"{len(infos)} frases: {len(lecturas)} descartadas por ser lectura (volumen bajo), "
+               f"{n_rep} descartadas por ser tomas repetidas. {len(grupos)} frases en la timeline.")
+    if usar_volumen and infos:
+        rep.append(f"Volumen normal medido: entre {min(u['ref'] for u in infos):.0f} y {max(u['ref'] for u in infos):.0f} dB "
+                   f"(se descarta lo que está {float(cfg.get('bajada') or 0):.0f} dB o más por debajo de lo normal del momento).")
+    if lecturas:
+        lugares = []
+        for u in sorted(lecturas, key=lambda x: x["t"]):
+            if not lugares or u["t"] - lugares[-1] > 8:
+                lugares.append(u["t"])
+        rep.append("Lecturas descartadas cerca de: " + ", ".join(mmss(t) for t in lugares[:20]) + ".")
+    faltas = []
+    if G:
+        sm = difflib.SequenceMatcher(None, Gn, final_n, autojunk=False)
+        ok = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                ok += i2 - i1
+            elif tag in ("delete", "replace") and i2 - i1 >= 4:
+                faltas.append(" ".join(G[k][1] for k in range(i1, i2)))
+        rep.append(f"{ok} de {len(G)} palabras del guion están en la timeline, en orden ({100 * ok / len(G):.0f} %).")
+        if faltas:
+            rep.append("Partes del guion que no aparecen (o se dijeron muy distinto):")
+            rep += ["  - " + f[:110] for f in faltas[:12]]
+            if len(faltas) > 12:
+                rep.append(f"  ... y {len(faltas) - 12} más (están en el log).")
+    rep.append(f"Marcadores: amarillo {cuenta[C_DUDA]} (revisar tomas), rosa {cuenta[C_DIFIERE]} (no está en el guion), "
+               f"azul {cuenta[C_ORDEN]} (fuera de orden)" + (f". {fallos} no se pudieron poner." if fallos else "."))
+    rep.append(f"Timeline creada: {nueva.GetName()} ({nv} trozos de video, {na} de audio" +
+               (f", {ne} pistas extra desactivadas)." if ne else ")."))
+    try:
+        huecos = revisar_huecos(nueva)
+        rep.append("Huecos entre clips: " + ("; ".join(huecos) if huecos else "ninguno (todo pegado)."))
+    except Exception as ex:
+        rep.append("No pude revisar los huecos: " + str(ex))
+    if nv == 0:
+        rep.append("OJO: no encontré video en esa pista de video.")
+    if not (ok_v and ok_a):
+        rep.append("OJO: Resolve rechazó parte de los clips. Revisá la timeline.")
+
+    try:
+        carpeta = os.path.dirname(cfg["guion"]) if cfg.get("guion") else os.path.expanduser("~")
+        ruta = os.path.join(carpeta, TL_NAME + "_auto_log.txt")
+        with open(ruta, "w", encoding="utf-8") as f:
+            f.write("\n".join(rep) + "\n")
+            if faltas:
+                f.write("\n=== PARTES DEL GUION QUE NO APARECEN ===\n" + "\n".join("- " + x for x in faltas) + "\n")
+            f.write("\n=== LECTURAS DESCARTADAS (posición en la original, caída de volumen) ===\n")
+            for u in sorted(lecturas, key=lambda x: x["t"]):
+                txt = " ".join(formas.get(Tn[k]) or limpiar(T[k][3]) for k in u["idx"])
+                f.write(f"{mmss(u['t']):>6}  -{u['caida']:.0f} dB  {txt[:120]}\n")
+            f.write("\n=== TRANSCRIPCIÓN FINAL, CORREGIDA CON EL GUION (tiempo en la timeline nueva) ===\n")
+            for g, pos in zip(grupos, pos_grupo):
+                txt = " ".join(formas.get(Tn[k]) or limpiar(T[k][3]) for k in g["idx"])
+                marca = mmss(pos / FPS) if pos is not None else "  ?  "
+                extra = f"  [{g['tomas']} tomas]" if g["tomas"] > 1 else ""
+                f.write(f"{marca:>6}  {txt}{extra}\n")
+        rep.append("\nLog y transcripción: " + ruta)
+    except Exception as ex:
+        rep.append("No pude guardar el log: " + str(ex))
+    reporte(rep)
+    progreso(100, "Listo")
 
 
 def main():
-    run({}, lambda *a: None, lambda *a: None)
+    cfg = {"guion": "", "pista": 1, "video": 1, "otras": False, "bajada": 7, "rango": "full",
+           "pausa": 0.5, "cache": True}
+
+    def progreso(p, msg):
+        print(f"[{p:3}] {msg}")
+
+    def reporte(lineas):
+        for l in lineas:
+            print("REPORTE: " + str(l))
+
+    correr(cfg, progreso, reporte)
