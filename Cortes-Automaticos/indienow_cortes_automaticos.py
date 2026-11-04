@@ -655,6 +655,7 @@ def run(cfg, progreso, reporte):
     segs = segmentos_audio(list(cfg.get("pistas") or [1]), float(cfg.get("inicio", 0.0)),
                            float(cfg.get("fin", 3600.0)), tempfile.mkdtemp())
     palabras, envs = transcribir(segs, cfg.get("prompt") or "", lambda p, m: progreso(int(p), m))
+    palabras = refinar(palabras, envs)
     progreso(60, "Analizando...")
     niv = niveles(palabras, envs) if envs else None
     alertas = alertas_transcripcion(palabras, niv)
@@ -668,8 +669,18 @@ def run(cfg, progreso, reporte):
     tl, ok_v, ok_a, nv, na, ne = construir([(round(ini * FPS), round(fin * FPS)) for ini, fin in cortes_f],
                                          cfg.get("pista_audio") or 1, cfg.get("pista_video") or 1,
                                          cfg.get("otras") or [])
+    for ini, fin, words, cob in validos:
+        try:
+            poner_marca(tl, round(ini * FPS), C_ORDEN, f"Corte @{mmss(ini)}", f"Guion ({len(words)} palabras)", max(1, round((fin - ini) * FPS)), CUSTOM)
+        except Exception:
+            pass
+    for ini, fin, motivo in descartados:
+        try:
+            poner_marca(tl, round(ini * FPS), C_DIFIERE, f"Descartado @{mmss(ini)}", str(motivo), max(1, round((fin - ini) * FPS)), CUSTOM)
+        except Exception:
+            pass
     progreso(100, f"Listo: {len(cortes_f)} cortes (video ok: {ok_v}, audio ok: {ok_a}).")
-    return {"cortes": cortes_f, "validos": validos, "descartados": descartados, "alertas": alertas}
+    return {"cortes": cortes_f, "validos": validos, "descartados": descartados, "alertas": alertas, "timeline": tl}
 
 
 def main():
