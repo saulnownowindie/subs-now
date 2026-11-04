@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
     Indie Now - Subtitulos - instalador automatico
     -----------------------------------------------
@@ -119,18 +119,37 @@ function Instalar-Requisitos {
     if ($LASTEXITCODE -ne 0) { throw 'Fallo la instalacion de dependencias (revisa la salida de pip).' }
 }
 
+function Buscar-FFmpegWinget {
+    $base = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (-not (Test-Path $base)) { return $null }
+    $exe = Get-ChildItem $base -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) { return $exe.DirectoryName }
+    return $null
+}
+
 function Asegurar-FFmpeg {
     Refrescar-Ruta
-    if (Get-Command ffmpeg -ErrorAction SilentlyContinue) { return $true }
+    if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command ffprobe -ErrorAction SilentlyContinue)) { return $true }
+
     $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) {
+    if ($winget -and -not (Buscar-FFmpegWinget)) {
         Detalle 'Instalando FFmpeg con winget...'
         & $winget.Source install --id Gyan.FFmpeg -e --scope user --silent `
-            --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
+            --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
         Refrescar-Ruta
-        if (Get-Command ffmpeg -ErrorAction SilentlyContinue) { return $true }
     }
-    return $false
+
+    # Si winget lo instalo pero no actualizo el PATH, se agrega a mano (PATH de usuario).
+    $dir = Buscar-FFmpegWinget
+    if ($dir) {
+        $env:Path = "$dir;$env:Path"
+        $usuario = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not $usuario) { $usuario = '' }
+        if (($usuario -split ';') -notcontains $dir) {
+            [Environment]::SetEnvironmentVariable('Path', ($usuario.TrimEnd(';') + ';' + $dir).TrimStart(';'), 'User')
+        }
+    }
+    return [bool](Get-Command ffmpeg -ErrorAction SilentlyContinue)
 }
 
 function Nuevo-Acceso {
@@ -192,14 +211,9 @@ Instalar-Requisitos
 Bien 'faster-whisper, ctranslate2, av, tokenizers, numpy, Pillow, python-docx'
 
 Paso '5/6  Archivos de la aplicacion'
-$archivos = @(
-    'subtitulos.py', 'subtitulos_ui.py', 'indie_ui.py', 'mezcla_audio.py',
-    'gpu_runtime.py', 'verificacion.py', 'verificar.py', 'cortes.py',
-    'SubsSaul.py'
-)
-foreach ($f in $archivos) {
-    $origen = Join-Path $RepoDir ('app\' + $f)
-    if (Test-Path $origen) { Copy-Item $origen $SubsDir -Force }
+# Copia TODOS los .py de app\ (asi un modulo nuevo nunca queda afuera).
+Get-ChildItem (Join-Path $RepoDir 'app') -Filter *.py | ForEach-Object {
+    Copy-Item $_.FullName $SubsDir -Force
 }
 Bien "Aplicacion copiada a $SubsDir"
 
