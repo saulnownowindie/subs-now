@@ -54,6 +54,24 @@ def _pythonw():
     return None
 
 
+def _env_con_ffmpeg():
+    """Entorno con FFmpeg (winget) en el PATH, aunque Resolve haya arrancado con el PATH viejo."""
+    env = os.environ.copy()
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    carpetas = []
+    base = local / "Microsoft" / "WinGet" / "Packages"
+    if base.is_dir():
+        for exe in base.rglob("ffmpeg.exe"):
+            carpetas.append(str(exe.parent))
+            break
+    links = local / "Microsoft" / "WinGet" / "Links"
+    if links.is_dir():
+        carpetas.append(str(links))
+    if carpetas:
+        env["PATH"] = os.pathsep.join(carpetas + [env.get("PATH", "")])
+    return env
+
+
 def main():
     if EXE_NUEVO.is_file():
         target, cwd = EXE_NUEVO, EXE_NUEVO.parent
@@ -80,6 +98,7 @@ def main():
     proc = subprocess.Popen(
         args,
         cwd=str(cwd),
+        env=_env_con_ffmpeg(),
         close_fds=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
