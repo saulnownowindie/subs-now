@@ -176,6 +176,7 @@ def cargar_config():
     if cfg.get("idioma_destino") not in NOMBRES_IDIOMA: cfg["idioma_destino"] = "es"
     if cfg.get("estilo_trad") not in ESTILOS_TRAD: cfg["estilo_trad"] = "palabras"
     cfg["traducir"] = bool(cfg.get("traducir"))
+    cfg["usar_parakeet"] = bool(cfg.get("usar_parakeet", True))
     return cfg
 
 
@@ -749,6 +750,7 @@ def corregir(palabras, guion, umbral_nombre=0.72, umbral=0.9):
 
 _ultimos = []
 _idioma_detectado = ""
+_motor_usado = ""
 
 
 def _sin_habla(texto):
@@ -817,10 +819,34 @@ def _dlls_cuda():
     return gpu_runtime.preparar_cuda()
 
 
-def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma="auto", con_guion=False, hotwords=""):
-    global _ultimos, _idioma_detectado
+def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma="auto", con_guion=False, hotwords="", usar_parakeet=True):
+    global _ultimos, _idioma_detectado, _motor_usado
     _ultimos = []
     _idioma_detectado = "" if idioma in ("", "auto") else idioma
+    if usar_parakeet:
+        # Motor nuevo: VAD + Parakeet (con fallback a Whisper por fragmento).
+        _motor_log("Motor seleccionado: PARAKEET ULTRA (VAD + ONNX).")
+        try:
+            pal_pk = _transcribir_parakeet_pal(segs, progreso, p_ini=p_ini, p_fin=p_fin)
+            if pal_pk:
+                _motor_usado = "Parakeet Ultra (VAD)"
+                progreso(p_fin, "Motor: transcripción con PARAKEET ULTRA lista.")
+                return pal_pk
+            _motor_usado = "Ninguno (VAD sin voz)"
+            _motor_log("El VAD no detectó voz; se devuelve sin texto (sin alucinaciones).")
+            progreso(p_fin, "Motor: el VAD no detectó voz; no se transcribe para evitar alucinaciones.")
+            return []
+        except Exception as exc:
+            if _cancelar_procesos.is_set():
+                raise
+            _motor_usado = None
+            _motor_log(f"PARAKEET falló ({type(exc).__name__}: {exc}); usando WHISPER (fallback).")
+            progreso(p_ini, "Motor: PARAKEET falló; usando WHISPER (fallback)…")
+    _motor_usado = None
+    _motor_log("Motor en uso: WHISPER (faster-whisper).")
+    _motor_intencion_whisper = usar_parakeet  # None solo si hubo fallback
+    if not _motor_intencion_whisper:
+        _motor_usado = "Whisper (faster-whisper)"
     language = None if idioma in ("", "auto") else idioma
     _dlls_cuda()
     from faster_whisper import WhisperModel
@@ -1154,26 +1180,150 @@ def agrupar_frases(palabras, max_palabras=14, max_dur=7.0, pausa=0.85):
 
 
 def _partir_frases(texto, limite=84):
-    texto = str(texto).strip()
+    texto = " ".join(str(texto or "").split())
     if len(texto) <= limite: return [texto] if texto else []
+
+    def _fines_oracion(t):
+        """Índices justo después de . ! ? … (ignora decimales y abreviaturas)."""
+        abreviaturas = {"mr", "mrs", "ms", "dr", "dra", "sr", "sra", "jr",
+                        "st", "prof", "etc", "vs", "ej", "ing", "lic",
+                        "av", "aprox", "p.ej"}
+        fines, i, n_t = [], 0, len(t)
+        while i < n_t:
+            if t[i] not in ".!?…":
+                i += 1
+                continue
+            j = i
+            while j < n_t and t[j] in ".!?…":
+                j += 1
+            # "3.5" no es fin de oración.
+            if t[i] == "." and j == i + 1 and 0 < i < n_t - 1 \
+                    and t[i - 1].isdigit() and t[i + 1].isdigit():
+                i = j
+                continue
+            if t[i] == ".":
+                k = i - 1
+                while k >= 0 and (t[k].isalnum() or t[k] in "'’"):
+                    k -= 1
+                token = t[k + 1:i].lower().strip("'’")
+                if token in abreviaturas:
+                    i = j
+                    continue
+            k = j
+            while k < n_t and t[k] in "\"'”’)]}":
+                k += 1
+            if k >= n_t or t[k].isspace():
+                fines.append(k)
+            i = k
+        return fines
+
+    def _mejor_corte(t, lim):
+        # Preferencia: fin de oración > coma > espacio; nunca cortar una palabra.
+        fines = [b for b in _fines_oracion(t) if 0 < b <= lim]
+        if fines:
+            return max(fines)
+        corte = t.rfind(", ", 0, lim + 1)
+        if corte > 0:
+            return corte + 1
+        corte = t.rfind(" ", 0, lim + 1)
+        if corte > 0:
+            return corte
+        # Sin espacio antes del límite: avanzar al siguiente espacio antes que
+        # partir una palabra larga.
+        corte = t.find(" ", lim)
+        return corte if corte > 0 else 0
+
     partes, resto = [], texto
     while len(resto) > limite:
-        corte = resto.rfind(", ", 0, limite + 1)
-        if corte < int(limite * 0.45): corte = resto.rfind(" ", 0, limite + 1)
-        if corte < int(limite * 0.45): corte = limite
+        corte = _mejor_corte(resto, limite)
+        if corte <= 0:
+            partes.append(resto.strip(" ,;"))
+            resto = ""
+            break
         trozo = resto[:corte].strip(" ,;")
         if trozo: partes.append(trozo)
         resto = resto[corte:].strip(" ,;")
     if resto: partes.append(resto)
-    return partes
+
+    # Guarda: un trozo sin ningún carácter alfanumérico (p. ej. "...") no es
+    # un subtítulo; se fusiona con el anterior o se descarta si es el primero.
+    limpias = []
+    for p in partes:
+        if any(c.isalnum() for c in p):
+            limpias.append(p)
+        elif limpias:
+            limpias[-1] = (limpias[-1] + " " + p).strip()
+    return limpias
 
 
 def _partir_palabras(texto, duracion):
-    palabras = str(texto).split()
-    if len(palabras) <= 2: return [texto]
+    texto = " ".join(str(texto or "").split())
+    if not texto: return []
+    palabras = texto.split()
     objetivo = max(1, min(len(palabras), int(round(duracion / 0.85))))
     tam = max(1, math.ceil(len(palabras) / objetivo))
-    return [" ".join(palabras[i:i + tam]) for i in range(0, len(palabras), tam)]
+
+    def _fines_oracion(t):
+        """Índices justo después de . ! ? … (ignora decimales y abreviaturas)."""
+        abreviaturas = {"mr", "mrs", "ms", "dr", "dra", "sr", "sra", "jr",
+                        "st", "prof", "etc", "vs", "ej", "ing", "lic",
+                        "av", "aprox", "p.ej"}
+        fines, i, n_t = [], 0, len(t)
+        while i < n_t:
+            if t[i] not in ".!?…":
+                i += 1
+                continue
+            j = i
+            while j < n_t and t[j] in ".!?…":
+                j += 1
+            # "3.5" no es fin de oración.
+            if t[i] == "." and j == i + 1 and 0 < i < n_t - 1 \
+                    and t[i - 1].isdigit() and t[i + 1].isdigit():
+                i = j
+                continue
+            if t[i] == ".":
+                k = i - 1
+                while k >= 0 and (t[k].isalnum() or t[k] in "'’"):
+                    k -= 1
+                token = t[k + 1:i].lower().strip("'’")
+                if token in abreviaturas:
+                    i = j
+                    continue
+            k = j
+            while k < n_t and t[k] in "\"'”’)]}":
+                k += 1
+            if k >= n_t or t[k].isspace():
+                fines.append(k)
+            i = k
+        return fines
+
+    def _oraciones(t):
+        # La oración manda: solo se trocea por palabras si una oración sola
+        # supera el tamaño objetivo de este subtítulo.
+        fines = [b for b in _fines_oracion(t) if 0 < b < len(t)]
+        if not fines:
+            return [t]
+        salida, previo = [], 0
+        for b in fines:
+            trozo = t[previo:b].strip()
+            if trozo: salida.append(trozo)
+            previo = b
+        resto = t[previo:].strip()
+        if resto: salida.append(resto)
+        return salida or [t]
+
+    oraciones = _oraciones(texto)
+    # Dos palabras sin fin de oración no se parten por duración (compatibilidad).
+    if len(palabras) <= 2 and len(oraciones) <= 1:
+        return [texto]
+    salida = []
+    for oracion in oraciones:
+        pal = oracion.split()
+        if len(pal) <= tam:
+            salida.append(oracion)
+        else:
+            salida.extend(" ".join(pal[i:i + tam]) for i in range(0, len(pal), tam))
+    return salida or [texto]
 
 
 def _agrupar_oraciones(unidades, textos, max_chars=320, max_dur=12.0, max_gap=1.2):
@@ -1209,42 +1359,122 @@ def _agrupar_oraciones(unidades, textos, max_chars=320, max_dur=12.0, max_gap=1.
     return grupos
 
 
-def _repartir_texto(texto, n):
+def _repartir_texto(texto, n, pesos=None):
     """Parte una traducción en n trozos en límites de palabra.
 
-    Los cortes se buscan cerca de la posición proporcional, así cada trozo
-    cae sobre el fragmento de audio que le corresponde sin partir palabras.
+    Los cortes se buscan cerca de la posición proporcional a los largos de
+    las unidades originales (no al azar de la traducción), prefiriendo fin de
+    oración y, si no hay, un espacio. Nunca parte una palabra: si no hay un
+    límite seguro, devuelve menos trozos y rellena con vacíos.
     """
     texto = " ".join(str(texto or "").split())
     if n <= 1 or not texto:
         return [texto] * max(1, n)
     if len(texto) <= n:
         return [texto] + [""] * (n - 1)
+
+    # NEW: los pesos son los largos de las unidades de audio originales; si no
+    # vienen (compatibilidad), se reparte 1/n como antes.
+    if pesos is None or len(pesos) != n:
+        pesos = [1.0] * n
+    else:
+        limpios = []
+        for p in pesos:
+            try:
+                limpios.append(max(1.0, float(p)))
+            except (TypeError, ValueError):
+                limpios.append(1.0)
+        pesos = limpios
+    total_peso = sum(pesos) or float(n)
+
+    def _fines_oracion(t):
+        """Índices justo después de . ! ? … (ignora decimales y abreviaturas)."""
+        abreviaturas = {"mr", "mrs", "ms", "dr", "dra", "sr", "sra", "jr",
+                        "st", "prof", "etc", "vs", "ej", "ing", "lic",
+                        "av", "aprox", "p.ej"}
+        fines, i, n_t = [], 0, len(t)
+        while i < n_t:
+            if t[i] not in ".!?…":
+                i += 1
+                continue
+            j = i
+            while j < n_t and t[j] in ".!?…":
+                j += 1
+            # "3.5" no es fin de oración.
+            if t[i] == "." and j == i + 1 and 0 < i < n_t - 1 \
+                    and t[i - 1].isdigit() and t[i + 1].isdigit():
+                i = j
+                continue
+            if t[i] == ".":
+                k = i - 1
+                while k >= 0 and (t[k].isalnum() or t[k] in "'’"):
+                    k -= 1
+                token = t[k + 1:i].lower().strip("'’")
+                if token in abreviaturas:
+                    i = j
+                    continue
+            k = j
+            while k < n_t and t[k] in "\"'”’)]}":
+                k += 1
+            if k >= n_t or t[k].isspace():
+                fines.append(k)
+            i = k
+        return fines
+
+    fines = set(_fines_oracion(texto))
     cortes, inicio = [], 0
     for k in range(1, n):
-        objetivo = round(len(texto) * k / n)
-        ventana = max(2, len(texto) // (n * 2))
-        lo = max(inicio + 1, objetivo - ventana)
-        hi = min(len(texto) - 1, objetivo + ventana)
-        mejor = None
-        for j in range(lo, hi + 1):
-            if texto[j] in " ,;:":
-                if mejor is None or abs(j - objetivo) < abs(mejor - objetivo):
-                    mejor = j
+        if inicio >= len(texto) - 1:
+            break
+        # NEW: objetivo acumulado según el largo real de cada unidad original.
+        objetivo = int(round(len(texto) * sum(pesos[:k]) / total_peso))
+        objetivo = min(len(texto) - 1, max(inicio + 1, objetivo))
+        esperado = len(texto) * pesos[k - 1] / total_peso
+
+        # 1) Fin de oración cerca del objetivo (ventana amplia: una oración
+        # corta como "Hello." debe poder absorber el corte).
+        ventana_oracion = max(4, int(round(esperado * 0.5)))
+        lo = max(inicio + 1, objetivo - ventana_oracion)
+        hi = min(len(texto) - 1, objetivo + ventana_oracion)
+        candidatos = [b for b in fines if lo <= b <= hi and b > inicio]
+        mejor = min(candidatos, key=lambda b: abs(b - objetivo)) if candidatos else None
+
+        # 2) Espacio más cercano al objetivo.
         if mejor is None:
-            mejor = texto.rfind(" ", inicio + 1, objetivo)
-            if mejor <= inicio:
-                mejor = texto.find(" ", objetivo)
-            if mejor <= inicio or mejor >= len(texto):
-                mejor = objetivo
+            ventana_espacio = max(2, int(round(esperado * 0.25)))
+            lo = max(inicio + 1, objetivo - ventana_espacio)
+            hi = min(len(texto) - 1, objetivo + ventana_espacio)
+            candidatos = [j for j in range(lo, hi + 1) if texto[j] == " "]
+            if candidatos:
+                mejor = min(candidatos, key=lambda j: abs(j - objetivo))
+
+        # 3) Sin espacio cerca: usar el espacio más cercano al objetivo en
+        # cualquier dirección (nunca a mitad de palabra).
+        if mejor is None:
+            antes = texto.rfind(" ", inicio + 1, objetivo + 1)
+            despues = texto.find(" ", objetivo, len(texto))
+            candidatos = []
+            if antes > inicio:
+                candidatos.append(antes)
+            if despues > 0:
+                candidatos.append(despues)
+            if candidatos:
+                mejor = min(candidatos, key=lambda j: abs(j - objetivo))
+        if mejor is None or mejor <= inicio or mejor >= len(texto):
+            break
         cortes.append(mejor)
-        inicio = mejor + 1
+        inicio = mejor
+
     partes, previo = [], 0
     for c in cortes:
         partes.append(texto[previo:c].strip(" ,;:"))
-        previo = c + 1
+        previo = c
     partes.append(texto[previo:].strip(" ,;:"))
-    return partes
+    # NEW: mantener n posiciones para que el zip con las unidades no se
+    # desalinee cuando no hubo suficientes cortes seguros.
+    if len(partes) < n:
+        partes.extend([""] * (n - len(partes)))
+    return partes[:n]
 
 
 def ajustar_ritmo(bloques, cps=17.0, min_dur=0.6, max_dur=8.0):
@@ -1274,7 +1504,10 @@ def bloques_traduccion(grupos, traducciones, estilo="palabras"):
         texto = (texto or "").strip()
         if not texto or not unidades:
             continue
-        partes = _repartir_texto(texto, len(unidades))
+        # NEW: repartir según el largo real del texto original de cada unidad
+        # (no por posición arbitraria dentro de la traducción).
+        pesos = [len(" ".join(str(w[0]).strip() for w in u)) for u in unidades]
+        partes = _repartir_texto(texto, len(unidades), pesos=pesos)
         for unidad, parte in zip(unidades, partes):
             parte = (parte or "").strip(" ,;:-")
             if not parte:
@@ -1717,9 +1950,10 @@ def generar(cfg, progreso):
         for n in nombres:
             if n.lower() not in {x.lower() for x in glos}: glos.append(n)
         prompt = ", ".join(glos)[:400]
-        terminos = traduccion_google.normalizar_terminos(glos, texto_guion, cfg.get("terminos", ""))
+        terminos = tg.normalizar_terminos(glos, texto_guion, cfg.get("terminos", ""))
         pal = transcribir(segs, prompt, progreso, p_ini=30, p_fin=90, idioma=idioma_audio,
-                          con_guion=bool(guion), hotwords=", ".join(glos)[:200])
+                          con_guion=bool(guion), hotwords=", ".join(glos)[:200],
+                          usar_parakeet=bool(cfg.get("usar_parakeet", True)))
         
         # Liberación de memoria para evitar el congelamiento post-transcripción
         gc.collect()
@@ -1766,6 +2000,8 @@ def generar(cfg, progreso):
             except Exception as ex: resumen_comp = f"No pude comparar con el guion: {ex}"
 
     partes = []
+    if _motor_usado:
+        partes.append(f"MOTOR DE TRANSCRIPCIÓN: {_motor_usado}")
     if hacer_txt:
         progreso(90, "Guardando transcripción...")
         # La transcripción sigue el nombre/destino elegido para el SRT: si
@@ -1795,6 +2031,19 @@ def generar(cfg, progreso):
         for b in bloques:
             b[0] = limpiar_puntuacion_final(b[0])
             if not b[0]: b[0] = "…"
+
+        # FIX BUG 1: Google devuelve oraciones con punto/comillas finales; se
+        # limpian igual que los bloques originales antes de escribir el SRT.
+        if ruta_trad:
+            for b in bloques_trad:
+                b[0] = limpiar_puntuacion_final(b[0])
+                if not b[0]: b[0] = "…"
+
+        _log(f"[generar] bloques originales={len(bloques)} "
+             f"traducidos={len(bloques_trad) if bloques_trad else 0}")
+        if ruta_trad:
+            partes.append(f"BLOQUES: {len(bloques)} originales / "
+                          f"{len(bloques_trad)} traducidos")
 
         progreso(91, "Guardando SRT...")
         srt_pedido = srt
@@ -1990,3 +2239,428 @@ if __name__ == "__main__":
         _log(f"fatal: {ex!r}\n{traceback.format_exc()}")
         try: messagebox.showerror("Indie Now - Subtítulos", str(ex))
         except Exception: print("ERROR:", ex)
+
+# === MOTOR DE TRANSCRIPCION VAD + PARAKEET (nuevo) ===
+
+import numpy as np
+
+def _motor_log(msg):
+    """Log del motor a consola (siempre visible) y a subtitulos.log."""
+    try:
+        print(f"[Motor] {msg}")
+    except Exception:
+        pass
+    try:
+        _log(f"[Motor] {msg}")
+    except Exception:
+        pass
+
+
+def _cargar_audio_mono_16k(audio_path):
+    """Carga audio a mono 16 kHz.
+
+    Prioriza ffmpeg: garantiza 16 kHz REALES (si el audio quedara a 48 kHz,
+    silero-vad igual lo trataria como 16 kHz y todos los tiempos saldrian
+    3x tarde — ese era el desfaso del SRT). scipy queda como respaldo.
+    """
+    try:
+        import subprocess, tempfile
+        wav_tmp = tempfile.mktemp(suffix="_indiedl16k.wav")
+        subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1",
+                        "-ar", "16000", wav_tmp],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=600)
+        import soundfile as sf
+        data, sr = sf.read(wav_tmp, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        try: os.remove(wav_tmp)
+        except Exception: pass
+        if len(data) == 0:
+            raise RuntimeError("ffmpeg produjo un wav vacío")
+        if sr != 16000:
+            raise RuntimeError(f"sr inesperado post-ffmpeg: {sr}")
+        return data.astype("float32"), 16000
+    except Exception as exc:
+        _motor_log(f"ffmpeg no pudo convertir a 16 kHz ({type(exc).__name__}: {exc}); "
+                   "intento con soundfile+scipy.")
+    import soundfile as sf
+    data, sr = sf.read(str(audio_path), dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr != 16000:
+        try:
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(sr, 16000)
+            data = resample_poly(data, 16000 // g, sr // g).astype("float32")
+        except Exception as exc:
+            raise RuntimeError(f"No se pudo remuestrear a 16 kHz ({sr}): {exc}")
+    return data.astype("float32"), 16000
+
+
+def preprocesar_audio(audio_path):
+    audio, sr = _cargar_audio_mono_16k(audio_path)
+    fragmentos = []
+    try:
+        import torch
+        try:
+            from silero_vad import load_silero_vad, get_speech_timestamps
+            model = load_silero_vad()
+            ts = get_speech_timestamps(audio, model, sampling_rate=sr)
+        except Exception:
+            model, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True)
+            get_speech_timestamps = utils[0]
+            ts = get_speech_timestamps(audio, model, sampling_rate=sr)
+        for seg in ts:
+            start = int(seg["start"])
+            end = int(seg["end"])
+            if end - start < int(sr * 0.3):
+                continue
+            fragmentos.append(audio[start:end])
+    except Exception as exc:
+        _motor_log(f"VAD: Silero no disponible o fallo ({type(exc).__name__}: {exc}); se usa el audio completo.")
+        if len(audio) > 0:
+            fragmentos.append(audio)
+    if not fragmentos:
+        return []
+    return fragmentos
+
+
+class ParakeetTranscriber:
+    """Motor Parakeet Ultra cargado con onnx-asr (encoder+decoder_joint ONNX).
+
+    El repo `Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` es un export ONNX puro
+    (model_type= nemo-conformer-tdt); transformers no lo puede abrir, por eso
+    se usa el paquete `onnx-asr`. Ese repo guarda la cuantización en
+    subcarpetas (int8/, fp16/…) y onnx-asr 0.12 busca los onnx en la raíz:
+    descargamos los archivos a `.parakeet-onnx` (junto a subtitulos.py).
+    """
+
+    mid = "Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx"
+
+    @classmethod
+    def _carpeta_local(cls):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".parakeet-onnx")
+
+    def __init__(self):
+        self.model = None
+        self.available = False
+        import shutil
+        from pathlib import Path
+        base = Path(self._carpeta_local())
+        dir_int8 = base / "int8"
+        ya_esta = all((base / nombre).exists() for nombre in
+                      ("config.json", "vocab.txt", "nemo128.onnx",
+                       "encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"))
+        if not ya_esta:
+            _motor_log("PARAKEET: modelo NO está descargado; bajando desde "
+                       "Hugging Face (solo la primera vez, puede tardar "
+                       "varios minutos y ocupa ~0,5 GB)…")
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id=self.mid,
+                    local_dir=base,
+                    allow_patterns=["config.json", "vocab.txt", "nemo128.onnx",
+                                    "int8/encoder-model.int8.onnx",
+                                    "int8/decoder_joint-model.int8.onnx"])
+                # onnx-asr 0.12 busca los onnx en la raíz del directorio local.
+                for nombre in ("encoder-model.int8.onnx",
+                               "decoder_joint-model.int8.onnx"):
+                    origen, destino = dir_int8 / nombre, base / nombre
+                    if origen.exists() and not destino.exists():
+                        shutil.copy2(origen, destino)
+            except Exception as exc:
+                _motor_log(f"PARAKEET: no se pudo descargar "
+                           f"({type(exc).__name__}: {exc}). Se usará WHISPER (fallback).")
+                return
+        else:
+            _motor_log("PARAKEET: modelo ya está descargado en disco; cargando…")
+        try:
+            import onnx_asr
+            # Carga OFFLINE: nombre oficial (tipo de modelo) + carpeta local
+            # con los archivos ya descargados (repo Olicorne).
+            self.model = onnx_asr.load_model(
+                "nemo-parakeet-tdt-0.6b-v3", base, quantization="int8")
+            self.available = True
+            _motor_log("PARAKEET ULTRA cargado correctamente y listo para "
+                       "transcribir (onnx-asr · int8).")
+        except Exception as exc:
+            _motor_log(f"PARAKEET falló al cargar ({type(exc).__name__}: {exc}). "
+                       "Se usará WHISPER (fallback).")
+            self.available = False
+
+    def transcribir_fragmento(self, audio_np, sr=16000):
+        if not self.available:
+            raise RuntimeError("Parakeet no disponible")
+        res = self.model.recognize(
+            np.asarray(audio_np, dtype="float32"), sample_rate=int(sr))
+        return str(getattr(res, "text", res)).strip()
+
+
+def transcribir_whisper(audio_path):
+    try:
+        from faster_whisper import WhisperModel
+        import numpy as np
+        # Leemos el audio con soundfile y pasamos el ARRAY a transcribe:
+        # las rutas de archivo hacen que faster-whisper use PyAV (av.open),
+        # y la versión instalada de av ya no acepta `metadata_errors`.
+        try:
+            import soundfile as sf
+            audio, sr = sf.read(str(audio_path), dtype="float32")
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+        except Exception as exc:
+            _motor_log(f"soundfile no pudo leer {audio_path} "
+                       f"({type(exc).__name__}: {exc}); convierto con ffmpeg.")
+            import subprocess, tempfile
+            tmp = tempfile.mktemp(suffix="_fw16k.wav")
+            subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1",
+                            "-ar", "16000", tmp],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            audio, sr = sf.read(tmp, dtype="float32")
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            try: os.remove(tmp)
+            except Exception: pass
+        sr = int(sr) or 16000
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segs, info = model.transcribe(audio, sampling_rate=sr, language=None)
+        partes = []
+        for s in segs:
+            partes.append(s.text.strip())
+        return " ".join(p for p in partes if p)
+    except Exception as exc:
+        _motor_log(f"WHISPER falló: {type(exc).__name__}: {exc}")
+        return ""
+
+
+def transcribir_audio(audio_path, usar_parakeet=True):
+    fragmentos = preprocesar_audio(audio_path)
+    if not fragmentos:
+        _motor_log("VAD: no se detectó voz; se devuelve cadena vacía para evitar alucinaciones.")
+        return ""
+    parakeet = None
+    if usar_parakeet:
+        parakeet = ParakeetTranscriber()
+    textos = []
+    for frag in fragmentos:
+        txt = ""
+        if usar_parakeet and parakeet is not None and parakeet.available:
+            try:
+                txt = parakeet.transcribir_fragmento(frag, 16000)
+            except Exception as exc:
+                _motor_log(f"PARAKEET falló en fragmento ({type(exc).__name__}: {exc}); cayendo a WHISPER.")
+                txt = ""
+        if not txt:
+            try:
+                import tempfile, soundfile as sf
+                tmp = tempfile.mktemp(suffix=".wav")
+                sf.write(tmp, frag, 16000)
+                txt = transcribir_whisper(tmp)
+            except Exception as exc:
+                _motor_log(f"WHISPER falló en fragmento: {type(exc).__name__}: {exc}")
+                txt = ""
+        if txt:
+            textos.append(txt)
+    return " ".join(t for t in textos if t).strip()
+
+
+def _palabras_de_tokens(tokens, timestamps):
+    """Agrupa tokens (piezas BPE) en palabras con su tiempo real.
+
+    Devuelve [] si no puede separar con confianza.
+    """
+    if not tokens or not timestamps or len(tokens) != len(timestamps):
+        return []
+    sep_encontrado = False
+    palabras = []
+    cur_txt, cur_ini, cur_fin = "", None, None
+    for raw_tok, ts in zip(tokens, timestamps):
+        raw = str(raw_tok)
+        limpia = raw.replace("▁", "").strip()
+        if not limpia:
+            continue
+        empieza = raw.startswith("▁") or raw != raw.lstrip()
+        if empieza:
+            sep_encontrado = True
+        try:
+            s = float(ts)
+        except (TypeError, ValueError):
+            continue
+        if empieza and cur_fin is not None:
+            palabras.append([cur_txt, cur_ini, cur_fin])
+            cur_txt, cur_ini, cur_fin = "", None, None
+        if cur_ini is None:
+            cur_ini, cur_fin = s, s
+            cur_txt = limpia
+        elif empieza:
+            cur_txt += " " + limpia
+        else:
+            cur_txt += limpia
+        cur_fin = s
+    if cur_txt:
+        palabras.append([cur_txt, cur_ini, cur_fin])
+    # Tokens sin separador (ni "▁" ni espacio): cada token ya es una palabra.
+    if not sep_encontrado and len(tokens) > 1:
+        out = []
+        for tok, ts in zip(tokens, timestamps):
+            limpia = str(tok).strip()
+            try:
+                s = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if limpia:
+                out.append([limpia, s, s + 0.02])
+        palabras = out
+    return [p for p in palabras if p[0]]
+
+
+def _transcribir_parakeet_pal(segs, progreso, p_ini=30, p_fin=90):
+    """Transcribe con VAD + Parakeet y devuelve palabras [[texto, t0, t1]].
+
+    Devuelve [] si el VAD no detecta voz (evita alucinaciones).
+    Lanza excepción si Parakeet no está disponible (transcribir() cae a Whisper).
+    Usa los timestamps REALES de tokens que entrega onnx-asr (si están); si no,
+    reparte las palabras dentro de su ventana de voz del VAD.
+    """
+    progreso(p_ini, "Motor: preparando PARAKEET ULTRA… (la primera vez descarga el modelo y puede tardar)")
+    parakeet = ParakeetTranscriber()
+    if not getattr(parakeet, "available", False):
+        raise RuntimeError("Parakeet no está disponible")
+    progreso(p_ini + 2, "Motor: PARAKEET ULTRA cargado; detectando voz con VAD…")
+
+    total = 0.0
+    for wav, _ in segs:
+        salida = ejecutar_proceso(["ffprobe", "-v", "error", "-show_entries",
+                                   "format=duration", "-of", "csv=p=0", wav],
+                                  capture_output=True)
+        try: total += float(salida.strip())
+        except Exception: pass
+    total = total or 1.0
+    SR = 16000
+
+    # VAD: preferimos el de onnx-asr (silero ONNX, sin torch); respaldo
+    # con silero-vad + torch si ese camino no está disponible.
+    asr_vad = None
+    vad_manual = None
+    get_speech_timestamps = None
+    try:
+        import onnx_asr
+        vad = onnx_asr.load_vad("silero")
+        # Orden clave: with_vad() ANTES de with_timestamps() — solo así los
+        # resultados conservan tokens+timestamps reales (TimestampedSegmentResult).
+        asr_vad = parakeet.model.with_vad(vad, min_speech_duration_ms=300).with_timestamps()
+        _motor_log("VAD silero (onnx-asr) activado con timestamps de tokens.")
+    except Exception as exc:
+        _motor_log(f"VAD de onnx-asr no disponible ({type(exc).__name__}: {exc}); "
+                   "uso silero-vad + torch.")
+        try:
+            import torch
+            from silero_vad import load_silero_vad
+            vad_manual = load_silero_vad()
+            from silero_vad import get_speech_timestamps
+            _motor_log("VAD silero cargado (paquete silero-vad).")
+        except Exception as exc2:
+            _motor_log(f"silero-vad pip fallo ({type(exc2).__name__}: {exc2}); "
+                       "descargando via torch.hub…")
+            import torch
+            vad_manual, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad",
+                                               model="silero_vad", trust_repo=True)
+            get_speech_timestamps = utils[0]
+
+    palabras = []
+    hecho = 0.0
+    # Sincronía: nunca dejar que un fragmento arranque antes que el fin del
+    # anterior (+10 ms). Evita que un sub del clip actual pise el anterior.
+    fin_prev = 0.0
+    n_frag = 0
+
+    def _emitir_palabras(lista, seg_inicio, seg_fin):
+        """Añade OR lo solape con lo ya emitido (max(inicio, fin_prev + 10 ms))."""
+        nonlocal fin_prev
+        if not lista:
+            return
+        n_pal = len(lista)
+        # Reparto uniforme de respaldo dentro de la ventana de voz.
+        paso = max(0.02, min(0.45, (seg_fin - seg_inicio) / max(1, n_pal)))
+        for w, s_i, e_i in lista:
+            s_i = max(float(s_i), fin_prev + 0.01)
+            e_i = max(float(e_i), s_i + min(paso, 0.45))
+            palabras.append([str(w), s_i, e_i])
+            fin_prev = e_i
+
+    for wav, t0 in segs:
+        if _cancelar_procesos.is_set():
+            raise RuntimeError("Proceso cancelado.")
+        audio, sr = _cargar_audio_mono_16k(wav)
+        if sr != SR:
+            _motor_log(f"audio a sr inesperado ({sr}); forzamos 16 kHz.")
+            sr = SR
+        dur_seg = (len(audio) / float(sr)) if len(audio) else 0.0
+        if asr_vad is not None:
+            resultados = list(asr_vad.recognize(audio, sample_rate=SR))
+        elif vad_manual is not None:
+            import torch
+            tensor = torch.from_numpy(np.asarray(audio, dtype="float32"))
+            ts = get_speech_timestamps(tensor, vad_manual, sampling_rate=SR) or []
+            resultados = []
+            for seg in ts:
+                ini, fin = int(seg["start"]), int(seg["end"])
+                if fin - ini < int(SR * 0.3):
+                    continue
+                try:
+                    texto = parakeet.transcribir_fragmento(audio[ini:fin], SR)
+                except Exception:
+                    import tempfile
+                    tmp = tempfile.mktemp(suffix="_frag.wav")
+                    try:
+                        import soundfile as sf
+                        sf.write(tmp, audio[ini:fin], SR)
+                        texto = transcribir_whisper(tmp)
+                    except Exception as exc_w:
+                        _motor_log(f"WHISPER también falló en fragmento: {type(exc_w).__name__}: {exc_w}")
+                        texto = ""
+                    finally:
+                        try: os.remove(tmp)
+                        except Exception: pass
+                resultados.append(type("RFrag", (), {"start": ini / float(SR),
+                                                     "end": fin / float(SR),
+                                                     "text": texto,
+                                                     "tokens": None,
+                                                     "timestamps": None})())
+        else:
+            resultados = []
+        if not resultados:
+            _motor_log(f"VAD: no se detectó voz en esta pista/segmento ({dur_seg:.1f}s sin voz).")
+
+        for res in resultados:
+            seg_inicio = t0 + float(res.start)
+            seg_fin = t0 + float(res.end)
+            n_frag += 1
+            if n_frag <= 3 or n_frag % 20 == 0:
+                _motor_log(f"VAD fragmento #{n_frag}: {seg_inicio:.2f}s → {seg_fin:.2f}s")
+            lista = []
+            tokens = getattr(res, "tokens", None)
+            stamps = getattr(res, "timestamps", None)
+            if tokens and stamps and len(tokens) == len(stamps):
+                lista = _palabras_de_tokens(tokens, stamps)
+                if lista:
+                    lista = [[w, t0 + s, t0 + e] for w, s, e in lista]
+            if not lista:
+                texto = str(getattr(res, "text", "") or "").strip()
+                palabras_txt = [w for w in texto.split() if w]
+                if not palabras_txt:
+                    continue
+                paso = max(0.02, min(0.45, (seg_fin - seg_inicio) / len(palabras_txt)))
+                lista = [[w, seg_inicio + i * paso, seg_inicio + (i + 1) * paso]
+                         for i, w in enumerate(palabras_txt)]
+            _emitir_palabras(lista, seg_inicio, seg_fin)
+        hecho += dur_seg
+        avance = min(1.0, hecho / total)
+        progreso(p_ini + (p_fin - p_ini) * avance,
+                 "Motor: transcribiendo con PARAKEET ULTRA…")
+    _motor_log(f"PARAKEET: {len(palabras)} palabras en {n_frag} fragmentos de voz.")
+    return palabras

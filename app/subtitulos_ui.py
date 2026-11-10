@@ -249,6 +249,7 @@ class SubtitulosApp:
         self.v_solo = tk.BooleanVar(value=bool(self.cfg.get("solo_srt", False)))
         self.v_idioma = tk.StringVar(value=self._lab_idioma.get(
             str(self.cfg.get("idioma", "auto")), "AUTOMÁTICO"))
+        self.v_parakeet = tk.BooleanVar(value=bool(self.cfg.get("usar_parakeet", True)))
         self.v_trad = tk.BooleanVar(value=bool(self.cfg.get("traducir", False)))
         self.v_destino = tk.StringVar(value=self._lab_destino.get(
             str(self.cfg.get("idioma_destino", "es")), "ESPAÑOL"))
@@ -607,6 +608,17 @@ class SubtitulosApp:
             variable=self.v_idioma, command=self._guardar, height=36)
         self.sel_idioma.pack(side="right", fill="x", expand=True, padx=(12, 0))
 
+        row_par = tk.Frame(body, bg=iu.SURFACE)
+        row_par.pack(fill="x", pady=(8, 0))
+        self.chk_parakeet = iu.BrandCheck(
+            row_par, "⚡ Usar Parakeet Ultra (Experimental)", self.v_parakeet,
+            command=self._parakeet_changed)
+        self.chk_parakeet.pack(fill="x")
+        self.lbl_motor = tk.Label(body, text="", bg=iu.SURFACE, fg=iu.MUTED,
+                                  font=(iu.F_BODY, 8), anchor="w")
+        self.lbl_motor.pack(fill="x", pady=(2, 0))
+        self._actualizar_motor_label()
+
         sep = tk.Frame(body, bg=iu.BORDER_SOFT, height=1)
         sep.pack(fill="x", pady=(10, 10))
         tk.Label(body, text="Alcance", bg=iu.SURFACE, fg=iu.MUTED,
@@ -859,6 +871,43 @@ class SubtitulosApp:
         except tk.TclError:
             pass
 
+    def _parakeet_changed(self):
+        """Refresca el indicador de motor y guarda la preferencia."""
+        self._actualizar_motor_label()
+        self._guardar()
+
+    def _actualizar_motor_label(self, texto=None):
+        """Muestra qué motor está activo/ en uso bajo el checkbox."""
+        if not getattr(self, "lbl_motor", None):
+            return
+        if texto:
+            tex = texto
+        elif self.v_parakeet.get():
+            tex = "⚡ Motor: Parakeet Ultra (Experimental) activado"
+        else:
+            tex = "Motor: Whisper (faster-whisper)"
+        try:
+            self.lbl_motor.configure(text=tex)
+        except Exception:
+            pass
+
+    def _actualizar_motor_desde_msg(self, msg):
+        """Actualiza el indicador según los mensajes de progreso del backend."""
+        if not getattr(self, "lbl_motor", None):
+            return
+        m = (msg or "").upper()
+        tex = None
+        if "PARAKEET" in m and ("FALL" in m or "WHISPER" in m):
+            tex = "Motor: WHISPER (fallback) — Parakeet no disponible"
+        elif "WHISPER" in m:
+            tex = "Motor: WHISPER en uso"
+        elif "PARAKEET" in m and ("DESCARG" in m or "PREPARANDO" in m or "CARGANDO" in m):
+            tex = "⏳ Motor: cargando Parakeet Ultra…"
+        elif "PARAKEET" in m and ("TRANSCRIBIENDO" in m or "CARGADO" in m or "LISTA" in m):
+            tex = "⚡ Motor: PARAKEET ULTRA en uso"
+        if tex:
+            self._actualizar_motor_label(texto=tex)
+
     def _guardar(self, *_):
         cfg = {
             "guion": self.v_guion.get(),
@@ -876,6 +925,7 @@ class SubtitulosApp:
             "estilo_trad": ("palabras" if self.v_estilo.get() == "PALABRAS"
                             else "frases"),
             "terminos": str(self.v_terminos.get() or "").strip(),
+            "usar_parakeet": self.v_parakeet.get(),
         }
         try:
             self.backend.guardar(cfg)
@@ -1268,10 +1318,12 @@ class SubtitulosApp:
             "estilo_trad": ("palabras" if self.v_estilo.get() == "PALABRAS"
                             else "frases"),
             "terminos": str(self.v_terminos.get() or "").strip(),
+            "usar_parakeet": self.v_parakeet.get(),
         }
         self._busy = True
         self._resultado_final = ""
         self._cancelando = False
+        self._actualizar_motor_label(texto="Motor: iniciando…")
         self.cta.set_enabled(False)
         self.cta.set_text("PROCESANDO…")
         self.btn_cancel.set_enabled(True)
@@ -1315,6 +1367,7 @@ class SubtitulosApp:
                         self.meter.set(p / 100.0)
                         self._set_estado("working", msg)
                         self._log(msg, "info")
+                        self._actualizar_motor_desde_msg(msg)
                 elif evento[0] == "error":
                     if self._cancelando:
                         self._set_estado("warn", "Cancelado. El SRT pudo haberse guardado; revisá si quedaron clips parciales en la timeline.")

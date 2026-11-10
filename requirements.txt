@@ -9,3 +9,13 @@ tokenizers>=0.20
 numpy>=1.26
 pillow>=10
 python-docx>=1.1
+
+# Motor de transcripcion Parakeet Ultra (VAD + ONNX): el repo de Hugging Face
+# Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx es ONNX puro y se carga con onnx-asr.
+onnx-asr>=0.12
+onnxruntime
+huggingface_hub>=1.31
+soundfile
+scipy
+silero-vad
+torch
