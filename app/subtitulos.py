@@ -2232,14 +2232,6 @@ def main():
     root.mainloop()
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as ex:
-        _log(f"fatal: {ex!r}\n{traceback.format_exc()}")
-        try: messagebox.showerror("Indie Now - Subtítulos", str(ex))
-        except Exception: print("ERROR:", ex)
-
 # === MOTOR DE TRANSCRIPCION VAD + PARAKEET (nuevo) ===
 
 import numpy as np
@@ -2664,3 +2656,12 @@ def _transcribir_parakeet_pal(segs, progreso, p_ini=30, p_fin=90):
                  "Motor: transcribiendo con PARAKEET ULTRA…")
     _motor_log(f"PARAKEET: {len(palabras)} palabras en {n_frag} fragmentos de voz.")
     return palabras
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as ex:
+        _log(f"fatal: {ex!r}\n{traceback.format_exc()}")
+        try: messagebox.showerror("Indie Now - Subtítulos", str(ex))
+        except Exception: print("ERROR:", ex)
